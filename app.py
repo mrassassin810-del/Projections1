@@ -311,7 +311,7 @@ if 'norm_df' in st.session_state:
     all_labels = hist_labels + proj_labels
 
     st.subheader(f"Historical & 5-Year Projections ({ticker})")
-    md = f"| Metric | {' | '.join(all_labels)} |\\n|---{'|---'*len(all_labels)}|\\n"
+    md = f"| Metric | {' | '.join(all_labels)} |\n|---{'|---'*len(all_labels)}|\n"
     
     for metric in display_order:
         row = f"| **{metric}** |"
@@ -332,7 +332,7 @@ if 'norm_df' in st.session_state:
                 is_good = (growth > 0 and metric in good_up) or (growth < 0 and metric not in good_up)
                 color = "#1d9e75" if is_good else "#a32d2d"
                 row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.9em;'>({growth_str})</span> |"
-        md += row + "\\n"
+        md += row + "\n"
 
     st.markdown(md, unsafe_allow_html=True)
     
@@ -342,7 +342,7 @@ if 'norm_df' in st.session_state:
     
     target_pe = st.number_input("Target P/E Ratio (Adjust to recalculate targets instantly):", value=25.0, step=1.0)
     
-    val_md = f"| Valuation | {' | '.join(proj_labels)} | 5-Yr CAGR |\\n|---{'|---'*len(proj_labels)}|---|\\n| **Target Price** |"
+    val_md = f"| Valuation | {' | '.join(proj_labels)} | 5-Yr CAGR |\n|---{'|---'*len(proj_labels)}|---|\n| **Target Price** |"
     target_prices = []
     
     for i in range(5):
@@ -420,12 +420,12 @@ if 'norm_df' in st.session_state:
     )
 
     line_eps = base.mark_line(color="#1d9e75", point=alt.OverlayMarkDef(color="#1d9e75", size=60)).encode(
-        y=alt.Y('Quarterly EPS:Q', title='Quarterly EPS ($)', axis=alt.Axis(titleColor='#1d9e75', grid=True)),
+        y=alt.Y('Quarterly EPS:Q', title='Quarterly EPS ($)', axis=alt.Axis(titleColor='#1d9e75', grid=True, minExtent=40)),
         tooltip=[alt.Tooltip('Date:T', format='%b %Y', title='Date'), 'Quarterly EPS']
     )
 
     line_price = base.mark_line(color="#e8a329", point=alt.OverlayMarkDef(color="#e8a329", size=60)).encode(
-        y=alt.Y(f'{price_col}:Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329', grid=False)),
+        y=alt.Y(f'{price_col}:Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329', grid=False, minExtent=40)),
         tooltip=[alt.Tooltip('Date:T', format='%b %Y', title='Date'), f'{price_col}']
     )
 
