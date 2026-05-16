@@ -5,3 +5,4 @@ numpy
 scikit-learn
 statsmodels
 altair
+lxml
