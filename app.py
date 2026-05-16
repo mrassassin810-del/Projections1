@@ -373,4 +373,48 @@ with tab_screener:
                 completed += 1
                 res = future.result()
                 if res:
+                    screened_results.append(res)
+                
+                if completed % 10 == 0 or completed == total_stocks:
+                    progress_bar.progress(completed / total_stocks)
+                    status_text.write(f"Processed {completed}/{total_stocks} companies...")
+
+        status_text.success(f"Matrix complete! Successfully built mathematical curves for {len(screened_results)} companies.")
+        st.session_state.screener_df = pd.DataFrame(screened_results)
+
+    if 'screener_df' in st.session_state:
+        df_display = st.session_state.screener_df.copy()
+
+        st.write("---")
+        st.subheader("🎛️ Filter & Rank Screened Opportunities")
         
+        f_col1, f_col2 = st.columns(2)
+        with f_col1:
+            max_rmse = st.slider("Filter out Low-Confidence Projections (Max Avg Tracking Error Allowed):", 
+                                float(df_display['Avg Tracking Error (RMSE)'].min()), 
+                                float(df_display['Avg Tracking Error (RMSE)'].max()), 
+                                float(df_display['Avg Tracking Error (RMSE)'].max() * 0.5))
+        with f_col2:
+            min_cagr = st.slider("Minimum Acceptable 5-Yr CAGR (%):", 
+                                 float(df_display['5-Yr CAGR'].min()), 
+                                 float(df_display['5-Yr CAGR'].max()), 
+                                 10.0)
+
+        filtered_df = df_display[
+            (df_display['Avg Tracking Error (RMSE)'] <= max_rmse) & 
+            (df_display['5-Yr CAGR'] >= min_cagr)
+        ]
+
+        filtered_df = filtered_df.sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
+        
+        st.write(f"Showing **{len(filtered_df)}** matches out of {len(df_display)} companies scanned, sorted by highest potential.")
+        
+        st.dataframe(
+            filtered_df.style.format({
+                "Current Price": "${:,.2f}",
+                "Year 5 Target": "${:,.2f}",
+                "5-Yr CAGR": "{:+.1f}%",
+                "Avg Tracking Error (RMSE)": "±${:,.0f}"
+            }),
+            use_container_width=True
+        )
