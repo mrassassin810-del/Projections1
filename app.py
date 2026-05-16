@@ -7,6 +7,7 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 import altair as alt
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Attempt to load advanced stats models
 try:
@@ -18,99 +19,16 @@ except ImportError:
 
 warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="Forecaster & Valuation Model", layout="wide")
-st.title("Advanced Income Statement Forecaster")
+st.set_page_config(page_title="Forecaster & Screening Engine", layout="wide")
 
 if not HAS_STATSMODELS:
     st.error("⚠️ **Missing Library:** To use ARIMA and Holt-Winters, please open your terminal and run: `pip install statsmodels`")
     st.stop()
 
-st.write("Calculates **Linear**, **Derivative**, **Logarithmic**, **Holt-Winters**, and **ARIMA** models. Auto-selects the lowest historical error (RMSE). Values in **Thousands ($000s)**.")
-
 drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Taxes', 'Shares Outstanding']
 model_choices = ["Auto", "Linear", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
 
-for m in drivers:
-    if f"ov_{m}" not in st.session_state:
-        st.session_state[f"ov_{m}"] = "Auto"
-
-def reset_overrides():
-    for m in drivers:
-        st.session_state[f"ov_{m}"] = "Auto"
-
-# --- UI CONTROLS ---
-col1, col2, col3 = st.columns([2, 2, 1])
-with col1:
-    ticker_input = st.text_input("Enter Ticker (e.g., PLTR, CRM, AMD):", "PLTR").upper()
-with col2:
-    lookback_input = st.number_input("Quarters back (0 = All):", min_value=0, max_value=40, value=0, step=1)
-with col3:
-    st.write("") 
-    st.write("")
-    analyze_btn = st.button("Fetch & Analyze")
-
-# --- DATA FETCHING ---
-if analyze_btn:
-    with st.spinner(f"Fetching data for {ticker_input}..."):
-        error_found = False
-        try:
-            stock = yf.Ticker(ticker_input)
-            df = stock.quarterly_income_stmt.T
-            if df.empty: df = stock.quarterly_financials.T
-            
-            if df.empty:
-                st.error(f"No financial data found for {ticker_input} on Yahoo Finance.")
-                error_found = True
-            else:
-                df.index = pd.to_datetime(df.index)
-                df = df.sort_index()
-
-                if 'Total Revenue' not in df.columns:
-                    st.error("Total Revenue data missing.")
-                    error_found = True
-                else:
-                    df_raw = df / 1000
-                    
-                    rev = df_raw['Total Revenue']
-                    gp = df_raw['Gross Profit'] if 'Gross Profit' in df_raw.columns else rev
-                    cogs = rev - gp
-                    op_inc = df_raw['Operating Income'] if 'Operating Income' in df_raw.columns else gp
-                    opex = gp - op_inc
-                    ni = df_raw['Net Income'] if 'Net Income' in df_raw.columns else op_inc
-                    non_op_taxes = ni - op_inc 
-                    
-                    if 'Diluted Average Shares' in df_raw.columns: shares = df_raw['Diluted Average Shares']
-                    elif 'Basic Average Shares' in df_raw.columns: shares = df_raw['Basic Average Shares']
-                    else: shares = pd.Series(1, index=df_raw.index)
-
-                    norm_df = pd.DataFrame({
-                        'Total Revenue': rev,
-                        'Cost Of Revenue': cogs,
-                        'Gross Profit': gp,
-                        'Operating Expense': opex,
-                        'Operating Income': op_inc,
-                        'Non-Op & Taxes': non_op_taxes,
-                        'Net Income': ni,
-                        'Shares Outstanding': shares,
-                        'EPS': ni / shares
-                    }).dropna()
-                    
-                    hist_1d = stock.history(period="1d")
-                    current_price = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
-
-                    st.session_state.norm_df = norm_df
-                    st.session_state.ticker_analyzed = ticker_input
-                    st.session_state.actual_lookback = lookback_input
-                    st.session_state.current_price = current_price
-
-        except Exception as e:
-            st.error(f"Error processing data: {e}")
-            error_found = True
-            
-        if error_found:
-            st.stop()
-
-# --- MATH ENGINE ---
+# --- CORE MATH ENGINE (REUSED FOR BOTH TABS) ---
 def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False, is_non_op=False):
     n = len(y)
     results = {}
@@ -124,7 +42,7 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     rmse_lin = np.sqrt(mean_squared_error(y, pred_lin_hist))
     results['Linear'] = {'forecast': pred_lin_fut, 'rmse': rmse_lin}
 
-    # 2. Derivative Model (Velocity)
+    # 2. Derivative Model
     if n >= 4:
         diffs = np.diff(y)
         x_diff = np.arange(len(diffs)).reshape(-1, 1)
@@ -178,14 +96,12 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     else:
         results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
 
-    # --- NON-OPERATING REALITY CLAMP ---
     if is_non_op:
         upper_bound = max(0, np.max(y)) * 1.5
         for name in results:
             if results[name]['forecast'] is not None:
                 results[name]['forecast'] = np.minimum(results[name]['forecast'], upper_bound)
 
-    # --- AUTO-FIT SELECTION LOGIC ---
     valid_models = []
     for name, data in results.items():
         if data['forecast'] is not None and data['rmse'] != float('inf'):
@@ -203,236 +119,261 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     results['AutoChoice'] = auto_choice
     return results
 
-if 'norm_df' in st.session_state:
-    norm_df = st.session_state.norm_df
-    ticker = st.session_state.ticker_analyzed
-    lookback = st.session_state.actual_lookback
-    current_price = st.session_state.current_price
-    
-    actual_lookback = len(norm_df) if lookback == 0 or lookback > len(norm_df) else lookback
-    df_reg = norm_df.tail(actual_lookback)
-    
-    x_historical = np.arange(len(df_reg)).reshape(-1, 1)
-    x_future = np.arange(len(df_reg), len(df_reg) + 20).reshape(-1, 1) 
-    
-    st.write("---")
-    
-    metric_results = {}
-    for metric in drivers:
-        y = df_reg[metric].values
-        is_exp = metric in ['Cost Of Revenue', 'Operating Expense']
-        is_sh = metric == 'Shares Outstanding'
-        is_nonop = metric == 'Non-Op & Taxes'
-        metric_results[metric] = calculate_metric_models(y, x_historical, x_future, is_expense=is_exp, is_shares=is_sh, is_non_op=is_nonop)
+# --- BACKGROUND WORKER FOR S&P SCREENER ---
+def process_single_screener_stock(ticker, target_pe):
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.quarterly_income_stmt.T
+        if df.empty: df = stock.quarterly_financials.T
+        if df.empty or 'Total Revenue' not in df.columns: return None
 
-    with st.expander("⚙️ Advanced: Override Projection Models", expanded=False):
-        st.write("Force specific math models for each line item. Auto-updates instantly.")
-        st.button("🔄 Reset all to Auto", on_click=reset_overrides)
-        cols = st.columns(5)
-        for i, metric in enumerate(drivers):
-            with cols[i]:
-                res = metric_results[metric]
+        df = df.sort_index()
+        df_raw = df / 1000
+
+        rev = df_raw['Total Revenue']
+        gp = df_raw['Gross Profit'] if 'Gross Profit' in df_raw.columns else rev
+        cogs = rev - gp
+        op_inc = df_raw['Operating Income'] if 'Operating Income' in df_raw.columns else gp
+        opex = gp - op_inc
+        ni = df_raw['Net Income'] if 'Net Income' in df_raw.columns else op_inc
+        non_op_taxes = ni - op_inc
+
+        if 'Diluted Average Shares' in df_raw.columns: shares = df_raw['Diluted Average Shares']
+        elif 'Basic Average Shares' in df_raw.columns: shares = df_raw['Basic Average Shares']
+        else: return None
+
+        norm_df = pd.DataFrame({
+            'Total Revenue': rev, 'Cost Of Revenue': cogs, 'Operating Expense': opex,
+            'Non-Op & Taxes': non_op_taxes, 'Shares Outstanding': shares, 'Net Income': ni
+        }).dropna()
+
+        if len(norm_df) < 5: return None
+
+        x_hist = np.arange(len(norm_df)).reshape(-1, 1)
+        x_fut = np.arange(len(norm_df), len(norm_df) + 20).reshape(-1, 1)
+
+        total_rmse = 0
+        proj_5y = {}
+
+        for metric in drivers:
+            y = norm_df[metric].values
+            res = calculate_metric_models(y, x_hist, x_fut, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes')
+            winning_model = res['AutoChoice']
+            total_rmse += res[winning_model]['rmse']
+            q_forecast = res[winning_model]['forecast']
+
+            if metric == 'Shares Outstanding': proj_5y[metric] = np.mean(q_forecast[16:20])
+            else: proj_5y[metric] = np.sum(q_forecast[16:20])
+
+        net_income_5y = (proj_5y['Total Revenue'] - proj_5y['Cost Of Revenue']) - proj_5y['Operating Expense'] + proj_5y['Non-Op & Taxes']
+        eps_5y = net_income_5y / proj_5y['Shares Outstanding'] if proj_5y['Shares Outstanding'] else 0
+        target_price_5y = eps_5y * target_pe
+
+        hist_1d = stock.history(period="1d")
+        current_p = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
+
+        if current_p <= 0 or target_price_5y <= 0: return None
+        cagr = (target_price_5y / current_p) ** (1/5) - 1
+        avg_rmse = total_rmse / len(drivers)
+
+        return {"Ticker": ticker, "Current Price": round(current_p, 2), "Year 5 Target": round(target_price_5y, 2), "5-Yr CAGR": round(cagr * 100, 2), "Avg Tracking Error (RMSE)": round(avg_rmse, 2)}
+    except:
+        return None
+
+# --- UI APP TABS ---
+tab_single, tab_screener = st.tabs(["📊 Single Ticker Forecast", "🔍 S&P 500 Screening Dashboard"])
+
+# ================= TAB 1: SINGLE FORECASTER =================
+with tab_single:
+    for m in drivers:
+        if f"ov_{m}" not in st.session_state: st.session_state[f"ov_{m}"] = "Auto"
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1: ticker_input = st.text_input("Enter Ticker:", "PLTR", key="single_tick").upper()
+    with col2: lookback_input = st.number_input("Quarters back (0 = All):", min_value=0, max_value=40, value=0, step=1, key="single_lb")
+    with col3:
+        st.write(""); st.write("")
+        analyze_btn = st.button("Fetch & Analyze", key="single_btn")
+
+    if analyze_btn:
+        with st.spinner(f"Fetching data for {ticker_input}..."):
+            error_found = False
+            try:
+                stock = yf.Ticker(ticker_input)
+                df = stock.quarterly_income_stmt.T
+                if df.empty: df = stock.quarterly_financials.T
                 
-                def fmt(o, r=res):
-                    if o == "Auto": return f"Auto (Picked {r['AutoChoice']})"
-                    if r[o]['rmse'] != float('inf'):
-                        return f"{o} (RMSE: ±${int(r[o]['rmse']):,})"
-                    return f"{o} (N/A - Insufficient Data)"
-                
-                st.selectbox(metric, options=model_choices, format_func=fmt, key=f"ov_{metric}")
+                if df.empty:
+                    st.error(f"No financial data found for {ticker_input} on Yahoo Finance.")
+                    error_found = True
+                else:
+                    df.index = pd.to_datetime(df.index)
+                    df = df.sort_index()
+                    if 'Total Revenue' not in df.columns:
+                        st.error("Total Revenue data missing.")
+                        error_found = True
+                    else:
+                        df_raw = df / 1000
+                        rev = df_raw['Total Revenue']
+                        gp = df_raw['Gross Profit'] if 'Gross Profit' in df_raw.columns else rev
+                        cogs = rev - gp
+                        op_inc = df_raw['Operating Income'] if 'Operating Income' in df_raw.columns else gp
+                        opex = gp - op_inc
+                        ni = df_raw['Net Income'] if 'Net Income' in df_raw.columns else op_inc
+                        non_op_taxes = ni - op_inc 
+                        
+                        if 'Diluted Average Shares' in df_raw.columns: shares = df_raw['Diluted Average Shares']
+                        elif 'Basic Average Shares' in df_raw.columns: shares = df_raw['Basic Average Shares']
+                        else: shares = pd.Series(1, index=df_raw.index)
 
-    proj_annual_data = {}
-    proj_quarterly_data = {}
-    errors = {}
-    methods = {}
-    
-    for metric in drivers:
-        res = metric_results[metric]
-        choice = st.session_state[f"ov_{metric}"]
+                        st.session_state.norm_df = pd.DataFrame({
+                            'Total Revenue': rev, 'Cost Of Revenue': cogs, 'Gross Profit': gp, 'Operating Expense': opex,
+                            'Operating Income': op_inc, 'Non-Op & Taxes': non_op_taxes, 'Net Income': ni, 'Shares Outstanding': shares, 'EPS': ni / shares
+                        }).dropna()
+                        
+                        hist_1d = stock.history(period="1d")
+                        st.session_state.current_price = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
+                        st.session_state.ticker_analyzed = ticker_input
+                        st.session_state.actual_lookback = lookback_input
+            except Exception as e:
+                st.error(f"Error processing data: {e}")
+                error_found = True
+            if error_found: st.stop()
+
+    if 'norm_df' in st.session_state and st.session_state.ticker_analyzed == ticker_input:
+        norm_df = st.session_state.norm_df
+        current_price = st.session_state.current_price
+        df_reg = norm_df.tail(len(norm_df) if st.session_state.actual_lookback == 0 else st.session_state.actual_lookback)
         
-        if choice == "Auto":
-            active_method = res['AutoChoice']
-            method_label = f"Auto picked: {active_method}"
-        else:
-            active_method = choice
-            method_label = f"Manual: {active_method}"
-            
-        if res[active_method]['forecast'] is None:
-            active_method = "Linear"
-            method_label = f"Forced Linear ({choice} Failed)"
-            
-        q_forecast = res[active_method]['forecast']
-        rmse = res[active_method]['rmse']
+        x_historical = np.arange(len(df_reg)).reshape(-1, 1)
+        x_future = np.arange(len(df_reg), len(df_reg) + 20).reshape(-1, 1) 
         
-        errors[metric] = rmse
-        methods[metric] = method_label
-        proj_quarterly_data[metric] = q_forecast
-        
-        is_sh = metric == 'Shares Outstanding'
-        if is_sh: proj_annual_data[metric] = [np.mean(q_forecast[i*4:(i+1)*4]) for i in range(5)]
-        else: proj_annual_data[metric] = [np.sum(q_forecast[i*4:(i+1)*4]) for i in range(5)]
+        metric_results = {}
+        for metric in drivers:
+            metric_results[metric] = calculate_metric_models(df_reg[metric].values, x_historical, x_future, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes')
 
-    proj_annual_data['Gross Profit'] = (np.array(proj_annual_data['Total Revenue']) - np.array(proj_annual_data['Cost Of Revenue'])).tolist()
-    proj_annual_data['Operating Income'] = (np.array(proj_annual_data['Gross Profit']) - np.array(proj_annual_data['Operating Expense'])).tolist()
-    proj_annual_data['Net Income'] = (np.array(proj_annual_data['Operating Income']) + np.array(proj_annual_data['Non-Op & Taxes'])).tolist()
-    proj_annual_data['EPS'] = (np.array(proj_annual_data['Net Income']) / np.array(proj_annual_data['Shares Outstanding'])).tolist()
+        with st.expander("⚙️ Advanced: Override Projection Models"):
+            st.button("🔄 Reset all to Auto", on_click=reset_overrides, key="reset_tab1")
+            cols = st.columns(5)
+            for i, metric in enumerate(drivers):
+                with cols[i]:
+                    st.selectbox(metric, options=model_choices, format_func=lambda o, r=metric_results[metric]: f"Auto ({r['AutoChoice']})" if o == "Auto" else (f"{o} (RMSE: ±${int(r[o]['rmse']):,})" if r[o]['rmse'] != float('inf') else f"{o} (N/A)"), key=f"ov_{metric}")
 
-    proj_quarterly_data['Gross Profit'] = proj_quarterly_data['Total Revenue'] - proj_quarterly_data['Cost Of Revenue']
-    proj_quarterly_data['Operating Income'] = proj_quarterly_data['Gross Profit'] - proj_quarterly_data['Operating Expense']
-    proj_quarterly_data['Net Income'] = proj_quarterly_data['Operating Income'] + proj_quarterly_data['Non-Op & Taxes']
-    proj_quarterly_data['EPS'] = proj_quarterly_data['Net Income'] / proj_quarterly_data['Shares Outstanding']
-
-    display_order = ['Total Revenue', 'Cost Of Revenue', 'Gross Profit', 'Operating Expense', 'Operating Income', 'Non-Op & Taxes', 'Net Income', 'Shares Outstanding', 'EPS']
-    
-    hist_labels = []
-    hist_data = {m: [] for m in display_order}
-    num_q = len(norm_df)
-    ltm_count = min(3, num_q // 4)
-    if ltm_count == 0: ltm_count = 1 
-
-    for i in range(ltm_count, 0, -1):
-        if i == 1:
-            chunk = norm_df.iloc[-4:] if num_q >= 4 else norm_df
-            hist_labels.append("LTM (Current)")
-        else:
-            chunk = norm_df.iloc[-(i*4):-((i-1)*4)]
-            hist_labels.append(f"LTM -{i-1}")
+        proj_annual_data, proj_quarterly_data, errors, methods = {}, {}, {}, {}
+        for metric in drivers:
+            res = metric_results[metric]
+            act = res['AutoChoice'] if st.session_state[f"ov_{metric}"] == "Auto" else st.session_state[f"ov_{metric}"]
+            if res[act]['forecast'] is None: act = "Linear"
             
+            proj_quarterly_data[metric] = res[act]['forecast']
+            errors[metric], methods[metric] = res[act]['rmse'], f"Auto: {act}" if st.session_state[f"ov_{metric}"] == "Auto" else f"Manual: {act}"
+            proj_annual_data[metric] = [np.mean(res[act]['forecast'][i*4:(i+1)*4]) if metric == 'Shares Outstanding' else np.sum(res[act]['forecast'][i*4:(i+1)*4]) for i in range(5)]
+
+        proj_annual_data['Gross Profit'] = (np.array(proj_annual_data['Total Revenue']) - np.array(proj_annual_data['Cost Of Revenue'])).tolist()
+        proj_annual_data['Operating Income'] = (np.array(proj_annual_data['Gross Profit']) - np.array(proj_annual_data['Operating Expense'])).tolist()
+        proj_annual_data['Net Income'] = (np.array(proj_annual_data['Operating Income']) + np.array(proj_annual_data['Non-Op & Taxes'])).tolist()
+        proj_annual_data['EPS'] = (np.array(proj_annual_data['Net Income']) / np.array(proj_annual_data['Shares Outstanding'])).tolist()
+
+        proj_quarterly_data['Gross Profit'] = proj_quarterly_data['Total Revenue'] - proj_quarterly_data['Cost Of Revenue']
+        proj_quarterly_data['Operating Income'] = proj_quarterly_data['Gross Profit'] - proj_quarterly_data['Operating Expense']
+        proj_quarterly_data['Net Income'] = proj_quarterly_data['Operating Income'] + proj_quarterly_data['Non-Op & Taxes']
+        proj_quarterly_data['EPS'] = proj_quarterly_data['Net Income'] / proj_quarterly_data['Shares Outstanding']
+
+        # Historical lists
+        hist_labels, hist_data = [], {m: [] for m in display_order}
+        num_q = len(norm_df)
+        ltm_c = min(3, num_q // 4) or 1
+        for i in range(ltm_c, 0, -1):
+            chunk = norm_df.iloc[-4:] if i == 1 else norm_df.iloc[-(i*4):-((i-1)*4)]
+            hist_labels.append("LTM (Current)" if i == 1 else f"LTM -{i-1}")
+            for m in display_order:
+                if m == 'Shares Outstanding': hist_data[m].append(chunk[m].mean())
+                elif m == 'EPS': hist_data[m].append(chunk['Net Income'].sum()/chunk['Shares Outstanding'].mean() if chunk['Shares Outstanding'].mean() else 0)
+                else: hist_data[m].append(chunk[m].sum())
+
+        proj_labels = [(norm_df.index[-1] + pd.DateOffset(months=12 * j)).strftime("LTM %b '%yE") for j in range(1, 6)]
+        
+        st.subheader(f"Historical & 5-Year Projections ({ticker_input})")
+        md = f"| Metric | {' | '.join(hist_labels + proj_labels)} |\n|---{'|---'*len(hist_labels + proj_labels)}|\n"
         for metric in display_order:
-            if metric == 'Shares Outstanding': hist_data[metric].append(chunk[metric].mean())
-            elif metric == 'EPS':
-                ni = chunk['Net Income'].sum()
-                sh = chunk['Shares Outstanding'].mean()
-                hist_data[metric].append(ni/sh if sh else 0)
-            else: hist_data[metric].append(chunk[metric].sum())
+            row = f"| **{metric}** |"
+            comb = hist_data[metric] + proj_annual_data[metric]
+            for idx, val in enumerate(comb):
+                val_str = f"${val:,.2f}" if metric == 'EPS' else f"{val:,.0f}"
+                if idx == 0: row += f" {val_str} |"
+                else:
+                    growth = (val - comb[idx-1]) / abs(comb[idx-1]) if comb[idx-1] else 0
+                    color = "#1d9e75" if (growth > 0 and metric in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) or (growth < 0 and metric not in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) else "#a32d2d"
+                    row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
+            md += row + "\n"
+        st.markdown(md, unsafe_allow_html=True)
 
-    last_date = norm_df.index[-1]
-    proj_labels = [(last_date + pd.DateOffset(months=12 * i)).strftime("LTM %b '%yE") for i in range(1, 6)]
-    all_labels = hist_labels + proj_labels
-
-    st.subheader(f"Historical & 5-Year Projections ({ticker})")
-    md = f"| Metric | {' | '.join(all_labels)} |\n|---{'|---'*len(all_labels)}|\n"
-    
-    for metric in display_order:
-        row = f"| **{metric}** |"
-        combined_vals = hist_data[metric] + proj_annual_data[metric]
+        st.write("---")
+        st.subheader("Implied Stock Price")
+        st.write(f"**Current Market Price:** ${current_price:,.2f}")
+        t_pe = st.number_input("Target P/E Ratio:", value=25.0, step=1.0, key="pe_tab1")
         
-        for i in range(len(combined_vals)):
-            val = combined_vals[i]
-            prev_val = combined_vals[i-1] if i > 0 else val 
-            growth = (val - prev_val) / abs(prev_val) if prev_val and prev_val != 0 else 0
+        t_prices = [proj_annual_data['EPS'][j] * t_pe for j in range(5)]
+        val_md = f"| Valuation | {' | '.join(proj_labels)} | 5-Yr CAGR |\n|---{'|---'*len(proj_labels)}|---|\n| **Target Price** |"
+        for tp in t_prices: val_md += f" **${tp:,.2f}** |"
+        cagr = (t_prices[-1] / current_price) ** (1/5) - 1 if current_price > 0 and t_prices[-1] > 0 else 0
+        val_md += f" <span style='color:{'#1d9e75' if cagr > 0 else '#a32d2d'}; font-weight:600;'>{cagr:+.1%}</span> |"
+        st.markdown(val_md, unsafe_allow_html=True)
+
+        # Chart Render Engine
+        st.subheader("Visual Forecasts")
+        combined_q_df = pd.concat([norm_df, pd.DataFrame(proj_quarterly_data, index=[norm_df.index[-1] + pd.DateOffset(months=3 * j) for j in range(1, 21)])])
+        ttm_eps = (combined_q_df['Net Income'].rolling(window=4, min_periods=1).sum() * (4 / combined_q_df['Net Income'].rolling(window=4, min_periods=1).count())) / combined_q_df['Shares Outstanding'].rolling(window=4, min_periods=1).mean()
+        
+        c_df = pd.DataFrame(index=combined_q_df.index)
+        c_df['Quarterly EPS'] = combined_q_df['EPS'].round(2)
+        c_df[f'Target Price (PE {t_pe:g})'] = (ttm_eps * t_pe).round(2)
+        c_df_reset = c_df.reset_index().rename(columns={'index': 'Date'})
+
+        base = alt.Chart(c_df_reset).encode(x=alt.X('Date:T', title=None, axis=alt.Axis(grid=True)))
+        l_eps = base.mark_line(color="#1d9e75", point=alt.OverlayMarkDef(color="#1d9e75", size=60)).encode(y=alt.Y('Quarterly EPS:Q', title='Quarterly EPS ($)', axis=alt.Axis(titleColor='#1d9e75', grid=True, minExtent=40)), tooltip=['Date:T', 'Quarterly EPS'])
+        l_prc = base.mark_line(color="#e8a329", point=alt.OverlayMarkDef(color="#e8a329", size=60)).encode(y=alt.Y(f'Target Price (PE {t_pe:g}):Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329', grid=False, minExtent=40)), tooltip=['Date:T', f'Target Price (PE {t_pe:g})'])
+        st.altair_chart(alt.layer(l_eps, l_prc).resolve_scale(y='independent').properties(height=400).interactive(), use_container_width=True)
+
+# ================= TAB 2: S&P 500 SCREENER =================
+with tab_screener:
+    st.subheader("S&P 500 Multi-Model Ranking Dashboard")
+    st.write("Scans the S&P 500, applies optimal tracking regressions per stock, and ranks them by 5-Year CAGR target potential.")
+
+    screener_pe = st.number_input("Universal Target P/E Multiple for Screen:", value=25.0, step=1.0, key="pe_screener")
+    
+    col_btn, col_status = st.columns([1, 3])
+    with col_btn:
+        start_screen = st.button("🚀 Start S&P 500 Matrix Scan")
+        
+    if start_screen:
+        # Pull live list from Wikipedia to bypass manual data tracking completely
+        with st.spinner("Fetching live S&P 500 Roster..."):
+            try:
+                sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
+                tickers = sp500_table['Symbol'].tolist()
+                # Clean up characters yfinance hates
+                tickers = [t.replace('.', '-') for t in tickers]
+            except Exception as e:
+                st.error(f"Failed to fetch stock index list: {e}")
+                st.stop()
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        screened_results = []
+        completed = 0
+        total_stocks = len(tickers)
+
+        # ThreadPoolExecutor triggers massive parallel processing on Streamlit's back-end
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            future_to_ticker = {executor.submit(process_single_screener_stock, t, screener_pe): t for t in tickers}
             
-            val_str = f"${val:,.2f}" if metric == 'EPS' else f"{val:,.0f}"
-            
-            if i == 0:
-                row += f" {val_str} |"
-            else:
-                growth_str = f"{growth:+.1%}"
-                good_up = ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']
-                is_good = (growth > 0 and metric in good_up) or (growth < 0 and metric not in good_up)
-                color = "#1d9e75" if is_good else "#a32d2d"
-                row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.9em;'>({growth_str})</span> |"
-        md += row + "\n"
-
-    st.markdown(md, unsafe_allow_html=True)
-    
-    st.write("---")
-    st.subheader(f"Implied Stock Price")
-    st.write(f"**Current Market Price ({ticker}):** ${current_price:,.2f}")
-    
-    target_pe = st.number_input("Target P/E Ratio (Adjust to recalculate targets instantly):", value=25.0, step=1.0)
-    
-    val_md = f"| Valuation | {' | '.join(proj_labels)} | 5-Yr CAGR |\n|---{'|---'*len(proj_labels)}|---|\n| **Target Price** |"
-    target_prices = []
-    
-    for i in range(5):
-        implied_price = proj_annual_data['EPS'][i] * target_pe
-        target_prices.append(implied_price)
-        val_md += f" **${implied_price:,.2f}** |"
-        
-    final_price = target_prices[-1]
-
-    if current_price > 0 and final_price > 0:
-        cagr = (final_price / current_price) ** (1/5) - 1
-        cagr_str = f"{cagr:+.1%}"
-        color_cagr = "#1d9e75" if cagr > 0 else "#a32d2d"
-        val_md += f" <span style='color:{color_cagr}; font-weight:600;'>{cagr_str}</span> |"
-    else:
-        val_md += f" <span style='color:gray;'>N/A</span> |"
-        
-    st.markdown(val_md, unsafe_allow_html=True)
-    
-    st.write("---")
-    
-    st.subheader("Winning Model & Historical Error (RMSE)")
-    st.write("RMSE reflects the average raw dollar deviation (in thousands) of the trendline against actual history. Lower error wins.")
-    cols = st.columns(len(drivers))
-    for i, (m) in enumerate(drivers):
-        err = errors[m]
-        method = methods[m]
-        with cols[i]:
-            err_disp = f"±${int(err):,}" if err != float('inf') else "N/A"
-            st.markdown(f"**{m}**<br>:{'green'}[{err_disp}]<br><span style='font-size:0.85em;color:gray;'>{method}</span>", unsafe_allow_html=True)
-
-    with st.expander("View Raw Quarterly History & Velocity"):
-        velocity_df = norm_df.diff(periods=4) 
-        hist_format = {col: "{:,.0f}" for col in norm_df.columns}
-        hist_format['EPS'] = "${:,.2f}"
-        
-        vcol1, vcol2 = st.columns(2)
-        with vcol1:
-            st.caption("Historical Quarterly Totals")
-            st.dataframe(norm_df.style.format(hist_format))
-        with vcol2:
-            st.caption("Quarterly YoY Differences")
-            st.dataframe(velocity_df.dropna(how='all').style.format(hist_format))
-
-    st.subheader("Visual Forecasts")
-    future_dates = [last_date + pd.DateOffset(months=3 * i) for i in range(1, 21)]
-    q_proj_df = pd.DataFrame(proj_quarterly_data, index=future_dates)
-    
-    # Chart 1: Totals
-    chart_df_totals = pd.concat([norm_df[['Total Revenue', 'Net Income']], q_proj_df[['Total Revenue', 'Net Income']]])
-    st.caption("Quarterly Revenue vs Net Income ($000s)")
-    st.line_chart(chart_df_totals, color=["#1f77b4", "#2ca02c"]) 
-
-    # Chart 2: TTM EPS & TTM Target Price (Altair Dual-Axis)
-    combined_q_df = pd.concat([norm_df, q_proj_df])
-    ttm_ni = combined_q_df['Net Income'].rolling(window=4, min_periods=1).sum()
-    run_rate_multiplier = 4 / combined_q_df['Net Income'].rolling(window=4, min_periods=1).count()
-    ttm_ni = ttm_ni * run_rate_multiplier
-    
-    ttm_shares = combined_q_df['Shares Outstanding'].rolling(window=4, min_periods=1).mean()
-    ttm_eps = ttm_ni / ttm_shares
-    
-    price_col = f"Target Price (PE {target_pe:g})"
-    
-    chart_df_eps = pd.DataFrame(index=combined_q_df.index)
-    chart_df_eps['Quarterly EPS'] = combined_q_df['EPS'].round(2)
-    chart_df_eps[price_col] = (ttm_eps * target_pe).round(2)
-    
-    chart_df_eps_reset = chart_df_eps.reset_index().rename(columns={'index': 'Date'})
-
-    st.caption("Quarterly Earnings Per Share (EPS) & Implied Stock Price (Based on TTM EPS)")
-    
-    base = alt.Chart(chart_df_eps_reset).encode(
-        x=alt.X('Date:T', title=None, axis=alt.Axis(grid=True))
-    )
-
-    line_eps = base.mark_line(color="#1d9e75", point=alt.OverlayMarkDef(color="#1d9e75", size=60)).encode(
-        y=alt.Y('Quarterly EPS:Q', title='Quarterly EPS ($)', axis=alt.Axis(titleColor='#1d9e75', grid=True, minExtent=40)),
-        tooltip=[alt.Tooltip('Date:T', format='%b %Y', title='Date'), 'Quarterly EPS']
-    )
-
-    line_price = base.mark_line(color="#e8a329", point=alt.OverlayMarkDef(color="#e8a329", size=60)).encode(
-        y=alt.Y(f'{price_col}:Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329', grid=False, minExtent=40)),
-        tooltip=[alt.Tooltip('Date:T', format='%b %Y', title='Date'), f'{price_col}']
-    )
-
-    dual_chart = alt.layer(line_eps, line_price).resolve_scale(
-        y='independent'
-    ).properties(
-        height=400
-    ).interactive()
-
-    st.altair_chart(dual_chart, use_container_width=True)
+            for future in as_completed(future_to_ticker):
+                completed += 1
+                res = future.result()
+                if res:
+                    screened_results.append(res)
+                
+                if completed % 10 == 0 or completed == total_stocks:
+          
