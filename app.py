@@ -357,7 +357,9 @@ with tab_screener:
     if start_screen:
         with st.spinner("Fetching live S&P 500 Roster..."):
             try:
-                sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
+                # Mask request options to prevent Wikipedia from triggering a 403 response
+                wiki_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"}
+                sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', storage_options=wiki_headers)[0]
                 tickers = sp500_table['Symbol'].tolist()
                 tickers = [t.replace('.', '-') for t in tickers]
             except Exception as e:
