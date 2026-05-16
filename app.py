@@ -25,8 +25,11 @@ if not HAS_STATSMODELS:
     st.error("⚠️ **Missing Library:** To use ARIMA and Holt-Winters, please open your terminal and run: `pip install statsmodels`")
     st.stop()
 
+st.write("Calculates **Linear**, **Derivative**, **Logarithmic**, **Holt-Winters**, and **ARIMA** models. Auto-selects the lowest historical error (RMSE). Values in **Thousands ($000s)**.")
+
 drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Taxes', 'Shares Outstanding']
 model_choices = ["Auto", "Linear", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
+display_order = ['Total Revenue', 'Cost Of Revenue', 'Gross Profit', 'Operating Expense', 'Operating Income', 'Non-Op & Taxes', 'Net Income', 'Shares Outstanding', 'EPS']
 
 # --- CORE MATH ENGINE (REUSED FOR BOTH TABS) ---
 def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False, is_non_op=False):
@@ -347,12 +350,10 @@ with tab_screener:
         start_screen = st.button("🚀 Start S&P 500 Matrix Scan")
         
     if start_screen:
-        # Pull live list from Wikipedia to bypass manual data tracking completely
         with st.spinner("Fetching live S&P 500 Roster..."):
             try:
                 sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
                 tickers = sp500_table['Symbol'].tolist()
-                # Clean up characters yfinance hates
                 tickers = [t.replace('.', '-') for t in tickers]
             except Exception as e:
                 st.error(f"Failed to fetch stock index list: {e}")
@@ -365,7 +366,6 @@ with tab_screener:
         completed = 0
         total_stocks = len(tickers)
 
-        # ThreadPoolExecutor triggers massive parallel processing on Streamlit's back-end
         with ThreadPoolExecutor(max_workers=15) as executor:
             future_to_ticker = {executor.submit(process_single_screener_stock, t, screener_pe): t for t in tickers}
             
@@ -373,7 +373,4 @@ with tab_screener:
                 completed += 1
                 res = future.result()
                 if res:
-                    screened_results.append(res)
-                
-                if completed % 10 == 0 or completed == total_stocks:
-          
+        
