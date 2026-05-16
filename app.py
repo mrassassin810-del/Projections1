@@ -27,6 +27,7 @@ if not HAS_STATSMODELS:
 
 st.write("Calculates **Linear**, **Derivative**, **Logarithmic**, **Holt-Winters**, and **ARIMA** models. Auto-selects the lowest historical error (RMSE). Values in **Thousands ($000s)**.")
 
+# --- GLOBAL CONFIG VARIABLES ---
 drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Taxes', 'Shares Outstanding']
 model_choices = ["Auto", "Linear", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
 display_order = ['Total Revenue', 'Cost Of Revenue', 'Gross Profit', 'Operating Expense', 'Operating Income', 'Non-Op & Taxes', 'Net Income', 'Shares Outstanding', 'EPS']
@@ -190,6 +191,10 @@ tab_single, tab_screener = st.tabs(["📊 Single Ticker Forecast", "🔍 S&P 500
 with tab_single:
     for m in drivers:
         if f"ov_{m}" not in st.session_state: st.session_state[f"ov_{m}"] = "Auto"
+
+    def reset_overrides():
+        for m in drivers:
+            st.session_state[f"ov_{m}"] = "Auto"
 
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1: ticker_input = st.text_input("Enter Ticker:", "PLTR", key="single_tick").upper()
