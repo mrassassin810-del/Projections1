@@ -311,7 +311,7 @@ if 'norm_df' in st.session_state:
     all_labels = hist_labels + proj_labels
 
     st.subheader(f"Historical & 5-Year Projections ({ticker})")
-    md = f"| Metric | {' | '.join(all_labels)} |\n|---{'|---'*len(all_labels)}|\n"
+    md = f"| Metric | {' | '.join(all_labels)} |\\n|---{'|---'*len(all_labels)}|\\n"
     
     for metric in display_order:
         row = f"| **{metric}** |"
@@ -332,7 +332,7 @@ if 'norm_df' in st.session_state:
                 is_good = (growth > 0 and metric in good_up) or (growth < 0 and metric not in good_up)
                 color = "#1d9e75" if is_good else "#a32d2d"
                 row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.9em;'>({growth_str})</span> |"
-        md += row + "\n"
+        md += row + "\\n"
 
     st.markdown(md, unsafe_allow_html=True)
     
@@ -342,7 +342,7 @@ if 'norm_df' in st.session_state:
     
     target_pe = st.number_input("Target P/E Ratio (Adjust to recalculate targets instantly):", value=25.0, step=1.0)
     
-    val_md = f"| Valuation | {' | '.join(proj_labels)} | 5-Yr CAGR |\n|---{'|---'*len(proj_labels)}|---|\n| **Target Price** |"
+    val_md = f"| Valuation | {' | '.join(proj_labels)} | 5-Yr CAGR |\\n|---{'|---'*len(proj_labels)}|---|\\n| **Target Price** |"
     target_prices = []
     
     for i in range(5):
@@ -391,10 +391,12 @@ if 'norm_df' in st.session_state:
     future_dates = [last_date + pd.DateOffset(months=3 * i) for i in range(1, 21)]
     q_proj_df = pd.DataFrame(proj_quarterly_data, index=future_dates)
     
+    # Chart 1: Totals
     chart_df_totals = pd.concat([norm_df[['Total Revenue', 'Net Income']], q_proj_df[['Total Revenue', 'Net Income']]])
     st.caption("Quarterly Revenue vs Net Income ($000s)")
     st.line_chart(chart_df_totals, color=["#1f77b4", "#2ca02c"]) 
 
+    # Chart 2: TTM EPS & TTM Target Price (Altair Dual-Axis)
     combined_q_df = pd.concat([norm_df, q_proj_df])
     ttm_ni = combined_q_df['Net Income'].rolling(window=4, min_periods=1).sum()
     run_rate_multiplier = 4 / combined_q_df['Net Income'].rolling(window=4, min_periods=1).count()
@@ -414,16 +416,16 @@ if 'norm_df' in st.session_state:
     st.caption("Quarterly Earnings Per Share (EPS) & Implied Stock Price (Based on TTM EPS)")
     
     base = alt.Chart(chart_df_eps_reset).encode(
-        x=alt.X('Date:T', title=None)
+        x=alt.X('Date:T', title=None, axis=alt.Axis(grid=True))
     )
 
-    line_eps = base.mark_line(color="#1d9e75").encode(
-        y=alt.Y('Quarterly EPS:Q', title='Quarterly EPS ($)', axis=alt.Axis(titleColor='#1d9e75')),
+    line_eps = base.mark_line(color="#1d9e75", point=alt.OverlayMarkDef(color="#1d9e75", size=60)).encode(
+        y=alt.Y('Quarterly EPS:Q', title='Quarterly EPS ($)', axis=alt.Axis(titleColor='#1d9e75', grid=True)),
         tooltip=[alt.Tooltip('Date:T', format='%b %Y', title='Date'), 'Quarterly EPS']
     )
 
-    line_price = base.mark_line(color="#e8a329").encode(
-        y=alt.Y(f'{price_col}:Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329')),
+    line_price = base.mark_line(color="#e8a329", point=alt.OverlayMarkDef(color="#e8a329", size=60)).encode(
+        y=alt.Y(f'{price_col}:Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329', grid=False)),
         tooltip=[alt.Tooltip('Date:T', format='%b %Y', title='Date'), f'{price_col}']
     )
 
@@ -431,8 +433,6 @@ if 'norm_df' in st.session_state:
         y='independent'
     ).properties(
         height=400
-    ).configure_axis(
-        grid=False 
-    )
+    ).interactive()
 
     st.altair_chart(dual_chart, use_container_width=True)
