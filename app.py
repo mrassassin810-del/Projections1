@@ -24,6 +24,22 @@ if not HAS_STATSMODELS:
     st.error("⚠️ **Missing Library:** Run: `pip install statsmodels`")
     st.stop()
 
+# --- PASSWORD GATE ---
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.title("🔒 System Locked")
+    pwd = st.text_input("Enter Access Password:", type="password")
+    if st.button("Unlock"):
+        # Uses your Streamlit secret if set, otherwise defaults to 'admin123'
+        if pwd == st.secrets.get("APP_PASSWORD", "admin123"):
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect Password")
+    st.stop() # Physically stops the rest of the code from running
+
 # --- GLOBAL CONFIG VARIABLES ---
 drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Taxes', 'Shares Outstanding']
 model_choices = ["Auto", "Linear", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
@@ -286,7 +302,7 @@ with tab_single:
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
             
-        st.markdown(md, unsafe_allow_html=True)
+        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
