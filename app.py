@@ -183,19 +183,17 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
     current_val = y[-1] if len(y) > 0 else 0
     auto_choice = valid_models[0][0] if valid_models else "Linear"
     
-    # Auto-Selection Engine with Strict Rejection Rules
     for name, rmse, forecast in valid_models:
         is_valid = True
         
         if current_val > 0:
             if metric_name == 'Total Revenue' and forecast[-1] > (current_val * 5.0):
-                is_valid = False # Reject: Unrealistic 500%+ growth 
+                is_valid = False 
             elif metric_name in ['Cost Of Revenue', 'Operating Expense'] and forecast[-1] < (current_val * 0.2):
-                is_valid = False # Reject: Mathematically erases company expenses
+                is_valid = False 
             elif metric_name == 'Shares Outstanding' and forecast[-1] < (current_val * 0.5):
-                is_valid = False # Reject: Buyback rate implies taking company private
+                is_valid = False 
                 
-        # Reject parabolic models that over-extrapolate brief spikes
         if name in ["Quadratic", "Derivative", "ARIMA"] and current_val > 0:
             if forecast[-1] > (current_val * 3.5):
                 is_valid = False
@@ -420,6 +418,10 @@ with tab_screener:
 
     if 'raw_screener_df' in st.session_state:
         df_base = st.session_state.raw_screener_df.copy()
+        
+        # PATCH: Prevent old caches from crashing the app due to missing Analyst Target column
+        if 'Analyst Target' not in df_base.columns:
+            df_base['Analyst Target'] = np.nan
         
         st.write("---")
         st.subheader("🎛️ Filter Opportunities")
