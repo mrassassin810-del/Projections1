@@ -30,18 +30,11 @@ drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Ta
 model_choices = ["Auto", "Linear", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
 display_order = ['Total Revenue', 'Cost Of Revenue', 'Gross Profit', 'Operating Expense', 'Operating Income', 'Non-Op & Taxes', 'Net Income', 'Shares Outstanding', 'EPS']
 
-# --- CORE MATH ENGINE WITH REVENUE REALITY GUARDRAILS ---
-def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False, is_non_op=False, is_revenue=False):
+# --- CORE MATH ENGINE ---
+def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False, is_non_op=False):
     n = len(y)
     results = {}
     floor_val = 1 if is_shares else 0
-
-    # Calculate recent historical growth trajectory to spot hyper-growth anomalies
-    recent_growth_anomaly = False
-    if n >= 4 and y[-4] > 0:
-        historical_yoy_growth = (y[-1] - y[-4]) / y[-4]
-        if historical_yoy_growth > 0.30:  # >30% YoY growth trigger
-            recent_growth_anomaly = True
 
     # 1. Base Linear Model
     lin_model = LinearRegression().fit(x_hist, y)
@@ -71,7 +64,7 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     else:
         results['Derivative'] = {'forecast': None, 'rmse': float('inf')}
 
-    # 3. Logarithmic Model (Growth Decay Engine)
+    # 3. Logarithmic Model
     x_log_hist = np.log(x_hist + 1)
     x_log_fut = np.log(x_fut + 1)
     log_model = LinearRegression().fit(x_log_hist, y)
@@ -105,7 +98,6 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     else:
         results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
 
-    # Reality Clamp: Mitigate compounding model melt
     if is_non_op:
         upper_bound = max(0, np.max(y)) * 1.2
         for name in results:
@@ -123,15 +115,8 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     for name, rmse, forecast in valid_models:
         if is_expense and slope > 0 and forecast[-1] < y[-1] and name != "Linear":
             continue
-        # Hard Clamp Protection: If high-growth stock, disqualify explosive models for core items
-        if recent_growth_anomaly and (is_revenue or is_expense) and name in ['Derivative', 'ARIMA', 'Linear']:
-            continue
         auto_choice = name
         break
-
-    # Final Fallback to Logarithmic if auto selection remains unsustainably high
-    if recent_growth_anomaly and auto_choice not in ['Logarithmic', 'Holt-Winters'] and results['Logarithmic']['forecast'] is not None:
-        auto_choice = 'Logarithmic'
 
     results['AutoChoice'] = auto_choice
     return results
@@ -174,7 +159,7 @@ def process_single_screener_stock(ticker, target_pe):
 
         for metric in drivers:
             y = norm_df[metric].values
-            res = calculate_metric_models(y, x_hist, x_fut, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes', metric == 'Total Revenue')
+            res = calculate_metric_models(y, x_hist, x_fut, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes')
             winning_model = res['AutoChoice']
             total_rmse += res[winning_model]['rmse']
             q_forecast = res[winning_model]['forecast']
@@ -209,7 +194,6 @@ with tab_single:
         for m in drivers:
             st.session_state[f"ov_{m}"] = "Auto"
 
-    # Mobile-Responsive UI layout blocks
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1: ticker_input = st.text_input("Enter Ticker:", "PLTR", key="single_tick").upper()
     with col2: lookback_input = st.number_input("Quarters back (0 = All):", min_value=0, max_value=40, value=0, step=1, key="single_lb")
@@ -272,7 +256,7 @@ with tab_single:
         
         metric_results = {}
         for metric in drivers:
-            metric_results[metric] = calculate_metric_models(df_reg[metric].values, x_historical, x_future, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes', metric == 'Total Revenue')
+            metric_results[metric] = calculate_metric_models(df_reg[metric].values, x_historical, x_future, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes')
 
         with st.expander("⚙️ Advanced: Override Projection Models"):
             st.button("🔄 Reset all to Auto", on_click=reset_overrides, key="reset_tab1")
@@ -327,8 +311,7 @@ with tab_single:
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
             
-        # Responsive CSS layout container to allow scrolling data tables on a smartphone screen
-        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
+        st.markdown(md, unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
