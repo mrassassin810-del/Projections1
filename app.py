@@ -198,11 +198,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
         if current_val > 0:
             if metric_name == 'Total Revenue' and forecast[-1] > (current_val * 5.0): is_valid = False 
             elif metric_name in ['Cost Of Revenue', 'Operating Expense'] and forecast[-1] < (current_val * 0.2): is_valid = False 
-            
-            # --- UPDATED DILUTION & BUYBACK FILTERS ---
-            elif metric_name == 'Shares Outstanding':
-                if forecast[-1] < (current_val * 0.5): is_valid = False # Extreme Buyback Cap
-                if forecast[-1] > (current_val * 1.2): is_valid = False # Extreme M&A Dilution Cap
+            elif metric_name == 'Shares Outstanding' and forecast[-1] < (current_val * 0.5): is_valid = False 
             
             if metric_name in ['Shares Outstanding', 'Operating Expense', 'Cost Of Revenue'] and slope > 0 and forecast[-1] < (current_val * 0.95): is_valid = False
         if name in ["Quadratic", "Derivative", "ARIMA"] and current_val > 0 and forecast[-1] > (current_val * 3.5): is_valid = False
@@ -242,7 +238,9 @@ def process_single_screener_stock(ticker):
         proj, total_rmse, _ = run_projections(norm_df, x_hist, x_fut)
         eps_y1 = proj['Net Income'][0] / max(1, proj['Shares Outstanding'][0])
         
-        try: f_eps = yf.Ticker(ticker).info.get('forwardEps', np.nan)
+        # PULL FUNDAMENTAL METRICS FOR ADVANCED FILTERING
+        info = yf.Ticker(ticker).info
+        try: f_eps = info.get('forwardEps', np.nan)
         except: f_eps = np.nan
 
         max_hist_ni = max(1, norm_df['Net Income'].max())
@@ -257,7 +255,24 @@ def process_single_screener_stock(ticker):
         eps_y5 = proj['Net Income'][-1] / max(1, proj['Shares Outstanding'][-1])
         if current_p <= 0 or eps_y5 <= 0: return None
 
-        return {"Ticker": ticker, "Current Price": round(current_p, 2), "Year 5 EPS": eps_y5, "Avg Tracking Error (RMSE)": round(total_rmse / len(drivers), 2)}
+        # Build Return Dictionary with deep metrics
+        res_dict = {
+            "Ticker": ticker, 
+            "Current Price": round(current_p, 2), 
+            "Year 5 EPS": eps_y5, 
+            "Avg Tracking Error (RMSE)": round(total_rmse / len(drivers), 2),
+            "Current P/E": info.get('trailingPE', np.nan),
+            "Forward P/E": info.get('forwardPE', np.nan),
+            "PEG Ratio": info.get('pegRatio', np.nan),
+            "P/B Ratio": info.get('priceToBook', np.nan),
+            "ROE (%)": (info.get('returnOnEquity', np.nan) * 100) if pd.notna(info.get('returnOnEquity')) else np.nan,
+            "ROA (%)": (info.get('returnOnAssets', np.nan) * 100) if pd.notna(info.get('returnOnAssets')) else np.nan,
+            "Debt/Equity": info.get('debtToEquity', np.nan),
+            "Current Ratio": info.get('currentRatio', np.nan),
+            "Gross Margin (%)": (info.get('grossMargins', np.nan) * 100) if pd.notna(info.get('grossMargins')) else np.nan,
+            "Profit Margin (%)": (info.get('profitMargins', np.nan) * 100) if pd.notna(info.get('profitMargins')) else np.nan,
+        }
+        return res_dict
     except: return None
 
 # --- UI APP TABS ---
@@ -339,9 +354,7 @@ with tab_single:
                     color = "#1d9e75" if (growth > 0 and metric in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) or (growth < 0 and metric not in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) else "#a32d2d"
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
-        
-        # Directly render the markdown (fixes the DeltaGenerator bug)
-        st.markdown(md, unsafe_allow_html=True)
+        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
@@ -353,97 +366,4 @@ with tab_single:
         t_prices = [proj_annual_data['EPS'][j] * t_pe for j in range(5)]
         val_md = f"| Valuation | {' | '.join(proj_labels)} | 5-Yr CAGR |\n|---{'|---'*len(proj_labels)}|---|\n| **Target Price** |"
         for tp in t_prices: val_md += f" **${tp:,.2f}** |"
-        cagr = (t_prices[-1] / current_price) ** (1/5) - 1 if current_price > 0 and t_prices[-1] > 0 else 0
-        val_md += f" <span style='color:{'#1d9e75' if cagr > 0 else '#a32d2d'}; font-weight:600;'>{cagr:+.1%}</span> |"
-        st.markdown(val_md, unsafe_allow_html=True)
-
-        st.subheader("Visual Forecasts")
-        combined_q_df = pd.concat([norm_df, pd.DataFrame(proj_quarterly_data, index=[norm_df.index[-1] + pd.DateOffset(months=3 * j) for j in range(1, 21)])])
-        ttm_eps = (combined_q_df['Net Income'].rolling(window=4, min_periods=1).sum() * (4 / combined_q_df['Net Income'].rolling(window=4, min_periods=1).count())) / combined_q_df['Shares Outstanding'].rolling(window=4, min_periods=1).mean()
-        
-        c_df = pd.DataFrame(index=combined_q_df.index)
-        c_df['Quarterly EPS'], c_df[f'Target Price (PE {t_pe:g})'] = combined_q_df['EPS'].round(2), (ttm_eps * t_pe).round(2)
-        c_df_reset = c_df.reset_index().rename(columns={'index': 'Date'})
-
-        base = alt.Chart(c_df_reset).encode(x=alt.X('Date:T', title=None, axis=alt.Axis(grid=True)))
-        l_eps = base.mark_line(color="#1d9e75", point=alt.OverlayMarkDef(color="#1d9e75", size=60)).encode(y=alt.Y('Quarterly EPS:Q', title='Quarterly EPS ($)', axis=alt.Axis(titleColor='#1d9e75', grid=True, minExtent=40)), tooltip=['Date:T', 'Quarterly EPS'])
-        l_prc = base.mark_line(color="#e8a329", point=alt.OverlayMarkDef(color="#e8a329", size=60)).encode(y=alt.Y(f'Target Price (PE {t_pe:g}):Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329', grid=False, minExtent=40)), tooltip=['Date:T', f'Target Price (PE {t_pe:g})'])
-        st.altair_chart(alt.layer(l_eps, l_prc).resolve_scale(y='independent').properties(height=350).interactive(), use_container_width=True)
-
-# ================= TAB 2: S&P 500 SCREENER =================
-with tab_screener:
-    st.subheader("S&P 500 Multi-Model Ranking Dashboard")
-    
-    if os.path.exists(CACHE_FILE) and 'raw_screener_df' not in st.session_state: st.session_state.raw_screener_df = pd.read_csv(CACHE_FILE)
-    st.markdown(f"**Data Last Loaded:** `{pd.to_datetime(os.path.getmtime(CACHE_FILE), unit='s').strftime('%B %d, %Y at %I:%M %p') if os.path.exists(CACHE_FILE) else 'Never'}`")
-    
-    st.write("### ⚡ Data Refresh Controls")
-    c1, c2, c3 = st.columns([2, 1, 1])
-
-    with c1:
-        st.write("Update the entire S&P 500 matrix (takes ~1 minute).")
-        if st.button("🔄 Force Refresh All (Annual API Scan)", use_container_width=True):
-            with st.spinner("Fetching S&P 500 Roster & Executing Fast Scan..."):
-                try: tickers = [t.replace('.', '-') for t in pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', storage_options={"User-Agent": "Mozilla/5.0"})[0]['Symbol'].tolist()]
-                except Exception as e: st.error(f"Failed to fetch stock index list: {e}"); st.stop()
-
-                progress_bar, status_text, screened_results, completed = st.progress(0), st.empty(), [], 0
-                with ThreadPoolExecutor(max_workers=15) as executor:
-                    for future in as_completed({executor.submit(process_single_screener_stock, t): t for t in tickers}):
-                        completed += 1
-                        if res := future.result(): screened_results.append(res)
-                        if completed % 15 == 0 or completed == len(tickers):
-                            progress_bar.progress(completed / len(tickers))
-                            status_text.write(f"Scanned {completed}/{len(tickers)}...")
-
-                status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
-                raw_df = pd.DataFrame(screened_results)
-                if 'Analyst Target' in raw_df.columns: raw_df = raw_df.drop(columns=['Analyst Target'])
-                raw_df.to_csv(CACHE_FILE, index=False)
-                st.session_state.raw_screener_df = raw_df
-                st.rerun()
-
-    with c2:
-        st.write("Targeted refresh for a single stock.")
-        refresh_tick = st.text_input("Ticker", placeholder="e.g. NVDA", label_visibility="collapsed").upper().strip()
-
-    with c3:
-        st.write("") 
-        if st.button("Targeted Update", use_container_width=True):
-            if refresh_tick and 'raw_screener_df' in st.session_state:
-                with st.spinner(f"Recalculating {refresh_tick}..."):
-                    if res := process_single_screener_stock(refresh_tick):
-                        df_cache = st.session_state.raw_screener_df
-                        if 'Analyst Target' in res: del res['Analyst Target']
-                        if refresh_tick in df_cache['Ticker'].values:
-                            for k, v in res.items(): df_cache.at[df_cache.index[df_cache['Ticker'] == refresh_tick][0], k] = v
-                        else: df_cache = pd.concat([df_cache, pd.DataFrame([res])], ignore_index=True)
-                        if 'Analyst Target' in df_cache.columns: df_cache = df_cache.drop(columns=['Analyst Target'])
-                        df_cache.to_csv(CACHE_FILE, index=False)
-                        st.session_state.raw_screener_df = df_cache
-                        st.rerun()
-                    else: st.error(f"Could not calculate projections for {refresh_tick}. Requires 3+ years of public data.")
-            elif not refresh_tick: st.warning("Please enter a ticker symbol.")
-            else: st.error("Cache is empty. Run a full scan first to build the database.")
-
-    if 'raw_screener_df' in st.session_state:
-        df_base = st.session_state.raw_screener_df.copy()
-        if 'Analyst Target' in df_base.columns: df_base = df_base.drop(columns=['Analyst Target'])
-        
-        st.write("---")
-        st.subheader("🎛️ Filter Opportunities")
-        col_search, col_pe = st.columns([1, 2])
-        search_ticker = col_search.text_input("🔍 Search Ticker:", "").upper()
-        screener_pe = col_pe.number_input("Universal Target P/E Multiple for Screen:", value=25.0, step=1.0, key="pe_screener")
-            
-        if search_ticker: df_base = df_base[df_base['Ticker'].str.contains(search_ticker, case=False, na=False)]
-        
-        df_base['Year 5 Target'] = df_base['Year 5 EPS'] * screener_pe
-        df_base['5-Yr CAGR'] = ((df_base['Year 5 Target'] / df_base['Current Price']) ** (1/5) - 1) * 100
-        
-        max_rmse = st.slider("Forecast Confidence Filter (Max Historical Tracking Error):", float(df_base['Avg Tracking Error (RMSE)'].min()), float(df_base['Avg Tracking Error (RMSE)'].max()), float(df_base['Avg Tracking Error (RMSE)'].max() * 0.4), help="Acts as a confidence interval. Lowering this strictness filters out unpredictable stocks.")
-        min_cagr = st.slider("Minimum Acceptable 5-Yr CAGR (%):", float(df_base['5-Yr CAGR'].min()), float(df_base['5-Yr CAGR'].max()), 12.0)
-
-        filtered_df = df_base[(df_base['Avg Tracking Error (RMSE)'] <= max_rmse) & (df_base['5-Yr CAGR'] >= min_cagr)].sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
-        st.write(f"Showing **{len(filtered_df)}** matching profiles.")
-        st.dataframe(filtered_df[["Ticker", "Current Price", "Year 5 Target", "5-Yr CAGR", "Avg Tracking Error (RMSE)"]].style.format({"Current Price": "${:,.2f}", "Year 5 Target": "${:,.2f}", "5-Yr CAGR": "{:+.1f}%", "Avg Tracking Error (RMSE)": "±${:,.0f}"}), use_container_width=True)
+        cagr = (t_prices[-1] / current_price) ** (1/5) - 1 if current_price > 0 and t
