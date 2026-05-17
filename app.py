@@ -121,16 +121,19 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
     rmse_lin = np.sqrt(mean_squared_error(y, lin_model.predict(x_hist)))
     results['Linear'] = {'forecast': pred_lin_fut, 'rmse': rmse_lin}
 
-    # 2. Quadratic
-    poly_features = np.column_stack((x_hist, x_hist**2))
-    poly_model = LinearRegression().fit(poly_features, y)
-    poly_fut_features = np.column_stack((x_fut, x_fut**2))
-    pred_poly_fut = np.maximum(floor_val, poly_model.predict(poly_fut_features))
-    rmse_poly = np.sqrt(mean_squared_error(y, poly_model.predict(poly_features)))
-    results['Quadratic'] = {'forecast': pred_poly_fut, 'rmse': rmse_poly}
+    # 2. Quadratic (DISABLED for < 6 data points to prevent parabolic hyper-inflation)
+    if n >= 6:
+        poly_features = np.column_stack((x_hist, x_hist**2))
+        poly_model = LinearRegression().fit(poly_features, y)
+        poly_fut_features = np.column_stack((x_fut, x_fut**2))
+        pred_poly_fut = np.maximum(floor_val, poly_model.predict(poly_fut_features))
+        rmse_poly = np.sqrt(mean_squared_error(y, poly_model.predict(poly_features)))
+        results['Quadratic'] = {'forecast': pred_poly_fut, 'rmse': rmse_poly}
+    else:
+        results['Quadratic'] = {'forecast': None, 'rmse': float('inf')}
 
-    # 3. Derivative
-    if n >= 4:
+    # 3. Derivative (Requires 5 points to build 4 stable differentials)
+    if n >= 5:
         diffs = np.diff(y)
         x_diff = np.arange(len(diffs)).reshape(-1, 1)
         deriv_model = LinearRegression().fit(x_diff, diffs)
@@ -181,7 +184,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
     valid_models.sort(key=lambda x: x[1]) 
     
     current_val = y[-1] if len(y) > 0 else 0
-    auto_choice = valid_models[0][0] if valid_models else "Linear"
+    safe_models = []
     
     for name, rmse, forecast in valid_models:
         is_valid = True
@@ -199,8 +202,14 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
                 is_valid = False
                 
         if is_valid:
-            auto_choice = name
-            break
+            safe_models.append(name)
+
+    # Fallback to pure stability if all models flag as dangerously volatile
+    if safe_models:
+        auto_choice = safe_models[0]
+    else:
+        if "Logarithmic" in [m[0] for m in valid_models]: auto_choice = "Logarithmic"
+        else: auto_choice = "Linear"
 
     results['AutoChoice'] = auto_choice
     return results
@@ -209,7 +218,8 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
 def process_single_screener_stock(ticker):
     norm_df, current_p, analyst_target, _ = fetch_financial_data(ticker, force_deep_dive=False)
     
-    if norm_df.empty or len(norm_df) < 5: return None
+    # Lowered threshold to 4 to prevent Yahoo Finance free-tier rejections
+    if norm_df.empty or len(norm_df) < 4: return None
 
     x_hist, x_fut = np.arange(len(norm_df)).reshape(-1, 1), np.arange(len(norm_df), len(norm_df) + 20).reshape(-1, 1)
     total_rmse = 0
@@ -435,10 +445,7 @@ with tab_screener:
                         res = process_single_screener_stock(refresh_tick)
                         if res:
                             df_cache = st.session_state.raw_screener_df
-                            
-                            # Backward compatibility patch for old caches
-                            if 'Analyst Target' not in df_cache.columns:
-                                df_cache['Analyst Target'] = np.nan
+                            if 'Analyst Target' not in df_cache.columns: df_cache['Analyst Target'] = np.nan
 
                             if refresh_tick in df_cache['Ticker'].values:
                                 idx = df_cache.index[df_cache['Ticker'] == refresh_tick][0]
@@ -459,10 +466,7 @@ with tab_screener:
 
     if 'raw_screener_df' in st.session_state:
         df_base = st.session_state.raw_screener_df.copy()
-        
-        # Fallback for old cache formats
-        if 'Analyst Target' not in df_base.columns:
-            df_base['Analyst Target'] = np.nan
+        if 'Analyst Target' not in df_base.columns: df_base['Analyst Target'] = np.nan
         
         st.write("---")
         st.subheader("🎛️ Filter Opportunities")
