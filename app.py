@@ -190,7 +190,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
     valid_models = sorted([(name, data['rmse'], data['forecast']) for name, data in results.items() if data['forecast'] is not None and data['rmse'] != float('inf')], key=lambda x: x[1])
     if force_conservative: valid_models = [m for m in valid_models if m[0] in ["Linear", "Logarithmic"]]
     
-    current_val, auto_choice = y[-1] if len(y) > 0 else 0, valid_models[0][0] if valid_models else "Linear"
+    current_val = y[-1] if len(y) > 0 else 0
     safe_models = []
     
     for name, rmse, forecast in valid_models:
@@ -209,18 +209,33 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
     results['AutoChoice'] = safe_models[0] if safe_models else ("Logarithmic" if "Logarithmic" in [m[0] for m in valid_models] else "Linear")
     return results
 
-# --- HELPER: UNIFIED PROJECTION RUNNER ---
+# --- HELPER: UNIFIED PROJECTION RUNNER (BULLETPROOFED) ---
 def run_projections(norm_df, x_hist, x_fut, overrides=None, force_conservative=False):
     q_proj, rmse_tot, metric_results = {}, 0, {}
     for metric in drivers:
         res = calculate_metric_models(norm_df[metric].values, x_hist, x_fut, metric, force_conservative)
         metric_results[metric] = res
         
+        # 1. Check for manual override, fallback to Auto string
         act = overrides.get(metric, "Auto") if overrides else "Auto"
-        if act == "Auto": act = res['AutoChoice']
-        if res[act]['forecast'] is None: act = "Linear"
         
-        q_proj[metric], rmse_tot = res[act]['forecast'], rmse_tot + res[act]['rmse']
+        # 2. Resolve "Auto" to the actual model name string
+        if act not in res or act == "Auto":
+            act = res.get('AutoChoice', 'Linear')
+            
+        # 3. Absolute Safety Net: If the resolved model threw an exception/None, force demote to Linear
+        model_data = res.get(act)
+        if not model_data or model_data.get('forecast') is None:
+            act = "Linear"
+            model_data = res.get("Linear")
+            
+        # 4. Doomsday Fallback: If even Linear fails, generate a mathematical flatline to prevent UI crashes
+        if not model_data or model_data.get('forecast') is None:
+            flat_val = norm_df[metric].values[-1] if len(norm_df[metric]) > 0 else 0
+            model_data = {'forecast': np.full(len(x_fut), flat_val), 'rmse': float('inf')}
+            
+        q_proj[metric] = model_data['forecast']
+        rmse_tot += model_data.get('rmse', 0) if model_data.get('rmse') != float('inf') else 0
 
     q_proj['Gross Profit'] = q_proj['Total Revenue'] - q_proj['Cost Of Revenue']
     q_proj['Operating Income'] = q_proj['Gross Profit'] - q_proj['Operating Expense']
@@ -329,7 +344,7 @@ with tab_single:
             st.button("🔄 Reset all to Auto", on_click=reset_overrides, key="reset_tab1")
             for metric in drivers:
                 res = metric_results[metric]
-                st.selectbox(metric, options=model_choices, format_func=lambda o, r=res: f"Auto ({r['AutoChoice']})" if o == "Auto" else (f"{o} (RMSE: ±${int(r[o]['rmse']):,})" if r[o]['rmse'] != float('inf') else f"{o} (N/A)"), key=f"ov_{metric}")
+                st.selectbox(metric, options=model_choices, format_func=lambda o, r=res: f"Auto ({r.get('AutoChoice', 'Linear')})" if o == "Auto" else (f"{o} (RMSE: ±${int(r[o]['rmse']):,})" if r.get(o) and r[o].get('rmse', float('inf')) != float('inf') else f"{o} (N/A)"), key=f"ov_{metric}")
 
         proj_annual_data = {}
         for metric in display_order:
@@ -447,7 +462,6 @@ with tab_screener:
     if 'raw_screener_df' in st.session_state:
         df_base = st.session_state.raw_screener_df.copy()
         
-        # Patch for caches loaded prior to the 16-metric expansion
         expected_cols = [
             "Market Cap (B)", "Rev Growth (%)", "Current P/E", "Forward P/E", 
             "PEG Ratio", "P/B Ratio", "P/S Ratio", "ROE (%)", "ROA (%)", 
@@ -466,7 +480,6 @@ with tab_screener:
             
             st.write("##### Enable specific filters to constrain the matrix:")
             
-            # Row 1: Valuations
             f1, f2, f3, f4 = st.columns(4)
             with f1:
                 t_pe = st.toggle("Max Current P/E")
@@ -481,7 +494,6 @@ with tab_screener:
                 t_pb = st.toggle("Max P/B Ratio")
                 if t_pb: max_pb_filter = st.number_input("Value:", value=15.0, key="v_pb")
 
-            # Row 2: Profitability & Health
             f5, f6, f7, f8 = st.columns(4)
             with f5:
                 t_roe = st.toggle("Min ROE (%)")
@@ -496,7 +508,6 @@ with tab_screener:
                 t_rg = st.toggle("Min Rev Growth (%)")
                 if t_rg: min_rg_filter = st.number_input("Value:", value=5.0, key="v_rg")
 
-            # Row 3: Momentum & Yield
             f9, f10, f11, f12 = st.columns(4)
             with f9:
                 t_dy = st.toggle("Min Div Yield (%)")
@@ -525,7 +536,6 @@ with tab_screener:
         df_base['Year 5 Target'] = df_base['Year 5 EPS'] * screener_pe
         df_base['5-Yr CAGR'] = ((df_base['Year 5 Target'] / df_base['Current Price']) ** (1/5) - 1) * 100
         
-        # Sequentially apply filters ONLY if the toggle is ON (allows NA values to pass if the filter is OFF)
         filtered_df = df_base.copy()
         if t_pe: filtered_df = filtered_df[(filtered_df['Current P/E'] <= max_pe_filter) & pd.notna(filtered_df['Current P/E'])]
         if t_peg: filtered_df = filtered_df[(filtered_df['PEG Ratio'] <= max_peg_filter) & pd.notna(filtered_df['PEG Ratio'])]
