@@ -198,7 +198,11 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
         if current_val > 0:
             if metric_name == 'Total Revenue' and forecast[-1] > (current_val * 5.0): is_valid = False 
             elif metric_name in ['Cost Of Revenue', 'Operating Expense'] and forecast[-1] < (current_val * 0.2): is_valid = False 
-            elif metric_name == 'Shares Outstanding' and forecast[-1] < (current_val * 0.5): is_valid = False 
+            
+            # --- UPDATED DILUTION & BUYBACK FILTERS ---
+            elif metric_name == 'Shares Outstanding':
+                if forecast[-1] < (current_val * 0.5): is_valid = False # Extreme Buyback Cap
+                if forecast[-1] > (current_val * 1.2): is_valid = False # Extreme M&A Dilution Cap
             
             if metric_name in ['Shares Outstanding', 'Operating Expense', 'Cost Of Revenue'] and slope > 0 and forecast[-1] < (current_val * 0.95): is_valid = False
         if name in ["Quadratic", "Derivative", "ARIMA"] and current_val > 0 and forecast[-1] > (current_val * 3.5): is_valid = False
@@ -209,7 +213,6 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
 
 # --- HELPER: UNIFIED PROJECTION RUNNER ---
 def run_projections(norm_df, x_hist, x_fut, overrides=None, force_conservative=False):
-    """Eliminates the duplicate calculation loops from Tab 1 and Tab 2."""
     q_proj, rmse_tot, metric_results = {}, 0, {}
     for metric in drivers:
         res = calculate_metric_models(norm_df[metric].values, x_hist, x_fut, metric, force_conservative)
@@ -293,7 +296,17 @@ with tab_single:
         overrides = {m: st.session_state[f"ov_{m}"] for m in drivers}
         proj_quarterly_data, _, metric_results = run_projections(df_reg, x_hist, x_fut, overrides=overrides)
 
-        with st.expander("⚙️ Advanced: Override Projection Models"):
+        with st.expander("⚙️ Advanced: Override Projection Models & Explanations"):
+            st.markdown("""
+            **Model Selection Guide (When to override the Auto-Picker):**
+            * **Linear:** Best for mature, stable value stocks with consistent trajectories (e.g., KO, JNJ).
+            * **Quadratic:** Best for identifying accelerating hyper-growth or cyclical supercycles (e.g., NVDA, PLTR).
+            * **Logarithmic:** Best for growth companies that are maturing and hitting market saturation (e.g., NFLX, PYPL).
+            * **Derivative:** Best for weighting recent momentum and sudden earnings trajectory shifts over long-term history.
+            * **Holt-Winters:** Best for tracking highly seasonal businesses with predictable intra-year swings (e.g., Retailers like TGT, Travel like DAL).
+            * **ARIMA:** Best for complex, macro-driven trajectories that do not fit clean geometric curves.
+            """)
+            st.write("---")
             st.button("🔄 Reset all to Auto", on_click=reset_overrides, key="reset_tab1")
             for metric in drivers:
                 res = metric_results[metric]
@@ -326,7 +339,9 @@ with tab_single:
                     color = "#1d9e75" if (growth > 0 and metric in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) or (growth < 0 and metric not in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) else "#a32d2d"
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
-        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
+        
+        # Directly render the markdown (fixes the DeltaGenerator bug)
+        st.markdown(md, unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
