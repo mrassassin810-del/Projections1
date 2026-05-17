@@ -190,7 +190,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
     valid_models = sorted([(name, data['rmse'], data['forecast']) for name, data in results.items() if data['forecast'] is not None and data['rmse'] != float('inf')], key=lambda x: x[1])
     if force_conservative: valid_models = [m for m in valid_models if m[0] in ["Linear", "Logarithmic"]]
     
-    current_val = y[-1] if len(y) > 0 else 0
+    current_val, auto_choice = y[-1] if len(y) > 0 else 0, valid_models[0][0] if valid_models else "Linear"
     safe_models = []
     
     for name, rmse, forecast in valid_models:
@@ -216,20 +216,14 @@ def run_projections(norm_df, x_hist, x_fut, overrides=None, force_conservative=F
         res = calculate_metric_models(norm_df[metric].values, x_hist, x_fut, metric, force_conservative)
         metric_results[metric] = res
         
-        # 1. Check for manual override, fallback to Auto string
         act = overrides.get(metric, "Auto") if overrides else "Auto"
-        
-        # 2. Resolve "Auto" to the actual model name string
-        if act not in res or act == "Auto":
-            act = res.get('AutoChoice', 'Linear')
+        if act not in res or act == "Auto": act = res.get('AutoChoice', 'Linear')
             
-        # 3. Absolute Safety Net: If the resolved model threw an exception/None, force demote to Linear
         model_data = res.get(act)
         if not model_data or model_data.get('forecast') is None:
             act = "Linear"
             model_data = res.get("Linear")
             
-        # 4. Doomsday Fallback: If even Linear fails, generate a mathematical flatline to prevent UI crashes
         if not model_data or model_data.get('forecast') is None:
             flat_val = norm_df[metric].values[-1] if len(norm_df[metric]) > 0 else 0
             model_data = {'forecast': np.full(len(x_fut), flat_val), 'rmse': float('inf')}
@@ -269,7 +263,7 @@ def process_single_screener_stock(ticker):
             proj, total_rmse, _ = run_projections(norm_df, x_hist, x_fut, force_conservative=True)
 
         eps_y5 = proj['Net Income'][-1] / max(1, proj['Shares Outstanding'][-1])
-        if current_p <= 0 or eps_y5 <= 0: return None
+        if current_p <= 0: return None
 
         return {
             "Ticker": ticker, 
@@ -462,6 +456,7 @@ with tab_screener:
     if 'raw_screener_df' in st.session_state:
         df_base = st.session_state.raw_screener_df.copy()
         
+        # Patch for older caches to prevent NA crash
         expected_cols = [
             "Market Cap (B)", "Rev Growth (%)", "Current P/E", "Forward P/E", 
             "PEG Ratio", "P/B Ratio", "P/S Ratio", "ROE (%)", "ROA (%)", 
@@ -470,7 +465,7 @@ with tab_screener:
         ]
         for col in expected_cols:
             if col not in df_base.columns: df_base[col] = np.nan
-        
+            
         st.write("---")
         
         with st.expander("🔬 Deep Toggle Filters", expanded=True):
@@ -480,44 +475,47 @@ with tab_screener:
             
             st.write("##### Enable specific filters to constrain the matrix:")
             
+            # Row 1: Valuations
             f1, f2, f3, f4 = st.columns(4)
             with f1:
                 t_pe = st.toggle("Max Current P/E")
                 if t_pe: max_pe_filter = st.number_input("Value:", value=50.0, key="v_pe")
             with f2:
+                t_fpe = st.toggle("Max Forward P/E")
+                if t_fpe: max_fpe_filter = st.number_input("Value:", value=35.0, key="v_fpe")
+            with f3:
                 t_peg = st.toggle("Max PEG Ratio")
                 if t_peg: max_peg_filter = st.number_input("Value:", value=3.0, key="v_peg")
-            with f3:
+            with f4:
                 t_ps = st.toggle("Max P/S Ratio")
                 if t_ps: max_ps_filter = st.number_input("Value:", value=10.0, key="v_ps")
-            with f4:
-                t_pb = st.toggle("Max P/B Ratio")
-                if t_pb: max_pb_filter = st.number_input("Value:", value=15.0, key="v_pb")
 
+            # Row 2: Profitability & Health
             f5, f6, f7, f8 = st.columns(4)
             with f5:
+                t_pb = st.toggle("Max P/B Ratio")
+                if t_pb: max_pb_filter = st.number_input("Value:", value=15.0, key="v_pb")
+            with f6:
                 t_roe = st.toggle("Min ROE (%)")
                 if t_roe: min_roe_filter = st.number_input("Value:", value=10.0, key="v_roe")
-            with f6:
+            with f7:
                 t_pm = st.toggle("Min Profit Margin (%)")
                 if t_pm: min_pm_filter = st.number_input("Value:", value=5.0, key="v_pm")
-            with f7:
+            with f8:
                 t_de = st.toggle("Max Debt/Equity")
                 if t_de: max_de_filter = st.number_input("Value:", value=200.0, key="v_de")
-            with f8:
-                t_rg = st.toggle("Min Rev Growth (%)")
-                if t_rg: min_rg_filter = st.number_input("Value:", value=5.0, key="v_rg")
 
+            # Row 3: Momentum & Yield
             f9, f10, f11, f12 = st.columns(4)
             with f9:
+                t_rg = st.toggle("Min Rev Growth (%)")
+                if t_rg: min_rg_filter = st.number_input("Value:", value=5.0, key="v_rg")
+            with f10:
                 t_dy = st.toggle("Min Div Yield (%)")
                 if t_dy: min_dy_filter = st.number_input("Value:", value=1.0, key="v_dy")
-            with f10:
+            with f11:
                 t_beta = st.toggle("Max Beta")
                 if t_beta: max_beta_filter = st.number_input("Value:", value=1.5, key="v_beta")
-            with f11:
-                t_mc = st.toggle("Min Market Cap (B)")
-                if t_mc: min_mc_filter = st.number_input("Value:", value=10.0, key="v_mc")
             with f12:
                 t_sh = st.toggle("Max Short %")
                 if t_sh: max_sh_filter = st.number_input("Value:", value=10.0, key="v_sh")
@@ -533,11 +531,17 @@ with tab_screener:
 
         if search_ticker: df_base = df_base[df_base['Ticker'].str.contains(search_ticker, case=False, na=False)]
         
+        # Safe CAGR Calculation for Negative Projections
         df_base['Year 5 Target'] = df_base['Year 5 EPS'] * screener_pe
-        df_base['5-Yr CAGR'] = ((df_base['Year 5 Target'] / df_base['Current Price']) ** (1/5) - 1) * 100
+        df_base['5-Yr CAGR'] = np.where(
+            df_base['Year 5 Target'] > 0,
+            ((df_base['Year 5 Target'] / df_base['Current Price']) ** (1/5) - 1) * 100,
+            -100.0 
+        )
         
         filtered_df = df_base.copy()
         if t_pe: filtered_df = filtered_df[(filtered_df['Current P/E'] <= max_pe_filter) & pd.notna(filtered_df['Current P/E'])]
+        if t_fpe: filtered_df = filtered_df[(filtered_df['Forward P/E'] <= max_fpe_filter) & pd.notna(filtered_df['Forward P/E'])]
         if t_peg: filtered_df = filtered_df[(filtered_df['PEG Ratio'] <= max_peg_filter) & pd.notna(filtered_df['PEG Ratio'])]
         if t_ps: filtered_df = filtered_df[(filtered_df['P/S Ratio'] <= max_ps_filter) & pd.notna(filtered_df['P/S Ratio'])]
         if t_pb: filtered_df = filtered_df[(filtered_df['P/B Ratio'] <= max_pb_filter) & pd.notna(filtered_df['P/B Ratio'])]
@@ -555,16 +559,19 @@ with tab_screener:
 
         filtered_df = filtered_df.sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
         
+        # Updated to include Forward P/E and Debt/Equity
         display_cols = [
             "Ticker", "Current Price", "Year 5 Target", "5-Yr CAGR", 
-            "Current P/E", "Rev Growth (%)", "PEG Ratio", "P/S Ratio", 
-            "ROE (%)", "Profit Margin (%)", "Div Yield (%)", "Avg Tracking Error (RMSE)"
+            "Current P/E", "Forward P/E", "PEG Ratio", "P/S Ratio", "P/B Ratio",
+            "ROE (%)", "Debt/Equity", "Profit Margin (%)", "Rev Growth (%)", 
+            "Div Yield (%)", "Avg Tracking Error (RMSE)"
         ]
         
         st.write(f"Showing **{len(filtered_df)}** matching profiles.")
         st.dataframe(filtered_df[display_cols].style.format({
             "Current Price": "${:,.2f}", "Year 5 Target": "${:,.2f}", "5-Yr CAGR": "{:+.1f}%", 
-            "Current P/E": "{:.2f}", "Rev Growth (%)": "{:.1f}%", "PEG Ratio": "{:.2f}", 
-            "P/S Ratio": "{:.2f}", "ROE (%)": "{:.1f}%", "Profit Margin (%)": "{:.1f}%", 
+            "Current P/E": "{:.2f}", "Forward P/E": "{:.2f}", "PEG Ratio": "{:.2f}", 
+            "P/S Ratio": "{:.2f}", "P/B Ratio": "{:.2f}", "ROE (%)": "{:.1f}%", 
+            "Debt/Equity": "{:.2f}", "Profit Margin (%)": "{:.1f}%", "Rev Growth (%)": "{:.1f}%", 
             "Div Yield (%)": "{:.2f}%", "Avg Tracking Error (RMSE)": "±${:,.0f}"
-        }), use_container_width=True)
+        }, na_rep="N/A"), use_container_width=True)
