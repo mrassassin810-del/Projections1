@@ -38,7 +38,7 @@ if not st.session_state.authenticated:
             st.rerun()
         else:
             st.error("Incorrect Password")
-    st.stop() # Physically stops the rest of the code from running
+    st.stop() 
 
 # --- GLOBAL CONFIG VARIABLES ---
 drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Taxes', 'Shares Outstanding']
@@ -302,7 +302,8 @@ with tab_single:
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
             
-        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
+        # FIX: Directly render the markdown without the nested st.markdown function
+        st.markdown(md, unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
