@@ -198,7 +198,9 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
         if current_val > 0:
             if metric_name == 'Total Revenue' and forecast[-1] > (current_val * 5.0): is_valid = False 
             elif metric_name in ['Cost Of Revenue', 'Operating Expense'] and forecast[-1] < (current_val * 0.2): is_valid = False 
-            elif metric_name == 'Shares Outstanding' and forecast[-1] < (current_val * 0.5): is_valid = False 
+            elif metric_name == 'Shares Outstanding':
+                if forecast[-1] < (current_val * 0.5): is_valid = False
+                if forecast[-1] > (current_val * 1.2): is_valid = False
             
             if metric_name in ['Shares Outstanding', 'Operating Expense', 'Cost Of Revenue'] and slope > 0 and forecast[-1] < (current_val * 0.95): is_valid = False
         if name in ["Quadratic", "Derivative", "ARIMA"] and current_val > 0 and forecast[-1] > (current_val * 3.5): is_valid = False
@@ -238,7 +240,6 @@ def process_single_screener_stock(ticker):
         proj, total_rmse, _ = run_projections(norm_df, x_hist, x_fut)
         eps_y1 = proj['Net Income'][0] / max(1, proj['Shares Outstanding'][0])
         
-        # PULL FUNDAMENTAL METRICS FOR ADVANCED FILTERING
         info = yf.Ticker(ticker).info
         try: f_eps = info.get('forwardEps', np.nan)
         except: f_eps = np.nan
@@ -255,24 +256,27 @@ def process_single_screener_stock(ticker):
         eps_y5 = proj['Net Income'][-1] / max(1, proj['Shares Outstanding'][-1])
         if current_p <= 0 or eps_y5 <= 0: return None
 
-        # Build Return Dictionary with deep metrics
-        res_dict = {
+        return {
             "Ticker": ticker, 
             "Current Price": round(current_p, 2), 
             "Year 5 EPS": eps_y5, 
             "Avg Tracking Error (RMSE)": round(total_rmse / len(drivers), 2),
+            "Market Cap (B)": info.get('marketCap', np.nan) / 1e9 if pd.notna(info.get('marketCap')) else np.nan,
+            "Rev Growth (%)": (info.get('revenueGrowth', np.nan) * 100) if pd.notna(info.get('revenueGrowth')) else np.nan,
             "Current P/E": info.get('trailingPE', np.nan),
             "Forward P/E": info.get('forwardPE', np.nan),
             "PEG Ratio": info.get('pegRatio', np.nan),
             "P/B Ratio": info.get('priceToBook', np.nan),
+            "P/S Ratio": info.get('priceToSalesTrailing12Months', np.nan),
             "ROE (%)": (info.get('returnOnEquity', np.nan) * 100) if pd.notna(info.get('returnOnEquity')) else np.nan,
             "ROA (%)": (info.get('returnOnAssets', np.nan) * 100) if pd.notna(info.get('returnOnAssets')) else np.nan,
             "Debt/Equity": info.get('debtToEquity', np.nan),
-            "Current Ratio": info.get('currentRatio', np.nan),
             "Gross Margin (%)": (info.get('grossMargins', np.nan) * 100) if pd.notna(info.get('grossMargins')) else np.nan,
             "Profit Margin (%)": (info.get('profitMargins', np.nan) * 100) if pd.notna(info.get('profitMargins')) else np.nan,
+            "Div Yield (%)": (info.get('dividendYield', np.nan) * 100) if pd.notna(info.get('dividendYield')) else 0.0,
+            "Beta": info.get('beta', np.nan),
+            "Short % Float": (info.get('shortPercentOfFloat', np.nan) * 100) if pd.notna(info.get('shortPercentOfFloat')) else np.nan
         }
-        return res_dict
     except: return None
 
 # --- UI APP TABS ---
@@ -354,7 +358,8 @@ with tab_single:
                     color = "#1d9e75" if (growth > 0 and metric in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) or (growth < 0 and metric not in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) else "#a32d2d"
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
-        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
+        
+        st.markdown(md, unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
@@ -411,6 +416,7 @@ with tab_screener:
 
                 status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
                 raw_df = pd.DataFrame(screened_results)
+                if 'Analyst Target' in raw_df.columns: raw_df = raw_df.drop(columns=['Analyst Target'])
                 raw_df.to_csv(CACHE_FILE, index=False)
                 st.session_state.raw_screener_df = raw_df
                 st.rerun()
@@ -426,9 +432,11 @@ with tab_screener:
                 with st.spinner(f"Recalculating {refresh_tick}..."):
                     if res := process_single_screener_stock(refresh_tick):
                         df_cache = st.session_state.raw_screener_df
+                        if 'Analyst Target' in res: del res['Analyst Target']
                         if refresh_tick in df_cache['Ticker'].values:
                             for k, v in res.items(): df_cache.at[df_cache.index[df_cache['Ticker'] == refresh_tick][0], k] = v
                         else: df_cache = pd.concat([df_cache, pd.DataFrame([res])], ignore_index=True)
+                        if 'Analyst Target' in df_cache.columns: df_cache = df_cache.drop(columns=['Analyst Target'])
                         df_cache.to_csv(CACHE_FILE, index=False)
                         st.session_state.raw_screener_df = df_cache
                         st.rerun()
@@ -439,68 +447,114 @@ with tab_screener:
     if 'raw_screener_df' in st.session_state:
         df_base = st.session_state.raw_screener_df.copy()
         
+        # Patch for caches loaded prior to the 16-metric expansion
+        expected_cols = [
+            "Market Cap (B)", "Rev Growth (%)", "Current P/E", "Forward P/E", 
+            "PEG Ratio", "P/B Ratio", "P/S Ratio", "ROE (%)", "ROA (%)", 
+            "Debt/Equity", "Gross Margin (%)", "Profit Margin (%)", 
+            "Div Yield (%)", "Beta", "Short % Float"
+        ]
+        for col in expected_cols:
+            if col not in df_base.columns: df_base[col] = np.nan
+        
         st.write("---")
         
-        # --- DEEP FILTERING PANEL ---
-        with st.expander("🔬 Advanced Fundamental Filters", expanded=True):
+        with st.expander("🔬 Deep Toggle Filters", expanded=True):
             col_search, col_pe = st.columns([1, 2])
             search_ticker = col_search.text_input("🔍 Search Ticker:", "").upper()
             screener_pe = col_pe.number_input("Universal Target P/E Multiple for Model:", value=25.0, step=1.0, key="pe_screener")
             
-            st.write("##### Fundamental Constraints")
+            st.write("##### Enable specific filters to constrain the matrix:")
+            
+            # Row 1: Valuations
             f1, f2, f3, f4 = st.columns(4)
             with f1:
-                max_pe_filter = st.number_input("Max Current P/E:", value=150.0)
+                t_pe = st.toggle("Max Current P/E")
+                if t_pe: max_pe_filter = st.number_input("Value:", value=50.0, key="v_pe")
             with f2:
-                max_peg_filter = st.number_input("Max PEG Ratio:", value=5.0)
+                t_peg = st.toggle("Max PEG Ratio")
+                if t_peg: max_peg_filter = st.number_input("Value:", value=3.0, key="v_peg")
             with f3:
-                min_roe_filter = st.number_input("Min ROE (%):", value=-50.0)
+                t_ps = st.toggle("Max P/S Ratio")
+                if t_ps: max_ps_filter = st.number_input("Value:", value=10.0, key="v_ps")
             with f4:
-                max_de_filter = st.number_input("Max Debt/Equity:", value=300.0)
-                
-            st.write("##### Momentum & Predictability")
-            f5, f6 = st.columns(2)
+                t_pb = st.toggle("Max P/B Ratio")
+                if t_pb: max_pb_filter = st.number_input("Value:", value=15.0, key="v_pb")
+
+            # Row 2: Profitability & Health
+            f5, f6, f7, f8 = st.columns(4)
             with f5:
-                max_rmse = st.slider("Max Tracking Error (RMSE):", float(df_base['Avg Tracking Error (RMSE)'].min()), float(df_base['Avg Tracking Error (RMSE)'].max()), float(df_base['Avg Tracking Error (RMSE)'].max() * 0.4))
+                t_roe = st.toggle("Min ROE (%)")
+                if t_roe: min_roe_filter = st.number_input("Value:", value=10.0, key="v_roe")
             with f6:
-                min_cagr = st.slider("Min 5-Yr CAGR (%):", float(df_base['5-Yr CAGR'].min()) if '5-Yr CAGR' in df_base.columns else -50.0, 100.0, 12.0)
-            
+                t_pm = st.toggle("Min Profit Margin (%)")
+                if t_pm: min_pm_filter = st.number_input("Value:", value=5.0, key="v_pm")
+            with f7:
+                t_de = st.toggle("Max Debt/Equity")
+                if t_de: max_de_filter = st.number_input("Value:", value=200.0, key="v_de")
+            with f8:
+                t_rg = st.toggle("Min Rev Growth (%)")
+                if t_rg: min_rg_filter = st.number_input("Value:", value=5.0, key="v_rg")
+
+            # Row 3: Momentum & Yield
+            f9, f10, f11, f12 = st.columns(4)
+            with f9:
+                t_dy = st.toggle("Min Div Yield (%)")
+                if t_dy: min_dy_filter = st.number_input("Value:", value=1.0, key="v_dy")
+            with f10:
+                t_beta = st.toggle("Max Beta")
+                if t_beta: max_beta_filter = st.number_input("Value:", value=1.5, key="v_beta")
+            with f11:
+                t_mc = st.toggle("Min Market Cap (B)")
+                if t_mc: min_mc_filter = st.number_input("Value:", value=10.0, key="v_mc")
+            with f12:
+                t_sh = st.toggle("Max Short %")
+                if t_sh: max_sh_filter = st.number_input("Value:", value=10.0, key="v_sh")
+
+            st.write("##### Engine Confidence Limits")
+            e1, e2 = st.columns(2)
+            with e1:
+                t_rmse = st.toggle("Max Tracking Error (RMSE)", value=True)
+                if t_rmse: max_rmse = st.slider("Max Tracking Error (RMSE):", float(df_base['Avg Tracking Error (RMSE)'].min()), float(df_base['Avg Tracking Error (RMSE)'].max()), float(df_base['Avg Tracking Error (RMSE)'].max() * 0.4), label_visibility="collapsed")
+            with e2:
+                t_cagr = st.toggle("Min 5-Yr CAGR (%)", value=True)
+                if t_cagr: min_cagr = st.slider("Min Acceptable 5-Yr CAGR (%):", float(df_base['5-Yr CAGR'].min()) if '5-Yr CAGR' in df_base.columns else -50.0, 100.0, 12.0, label_visibility="collapsed")
+
         if search_ticker: df_base = df_base[df_base['Ticker'].str.contains(search_ticker, case=False, na=False)]
         
         df_base['Year 5 Target'] = df_base['Year 5 EPS'] * screener_pe
         df_base['5-Yr CAGR'] = ((df_base['Year 5 Target'] / df_base['Current Price']) ** (1/5) - 1) * 100
         
-        # Apply the new deep filters (allowing NA values to pass through so we don't screen out stocks with slight missing data on YF)
-        filtered_df = df_base[
-            (df_base['Avg Tracking Error (RMSE)'] <= max_rmse) & 
-            (df_base['5-Yr CAGR'] >= min_cagr) &
-            ((df_base['Current P/E'] <= max_pe_filter) | df_base['Current P/E'].isna()) &
-            ((df_base['PEG Ratio'] <= max_peg_filter) | df_base['PEG Ratio'].isna()) &
-            ((df_base['ROE (%)'] >= min_roe_filter) | df_base['ROE (%)'].isna()) &
-            ((df_base['Debt/Equity'] <= max_de_filter) | df_base['Debt/Equity'].isna())
-        ].sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
+        # Sequentially apply filters ONLY if the toggle is ON (allows NA values to pass if the filter is OFF)
+        filtered_df = df_base.copy()
+        if t_pe: filtered_df = filtered_df[(filtered_df['Current P/E'] <= max_pe_filter) & pd.notna(filtered_df['Current P/E'])]
+        if t_peg: filtered_df = filtered_df[(filtered_df['PEG Ratio'] <= max_peg_filter) & pd.notna(filtered_df['PEG Ratio'])]
+        if t_ps: filtered_df = filtered_df[(filtered_df['P/S Ratio'] <= max_ps_filter) & pd.notna(filtered_df['P/S Ratio'])]
+        if t_pb: filtered_df = filtered_df[(filtered_df['P/B Ratio'] <= max_pb_filter) & pd.notna(filtered_df['P/B Ratio'])]
+        if t_roe: filtered_df = filtered_df[(filtered_df['ROE (%)'] >= min_roe_filter) & pd.notna(filtered_df['ROE (%)'])]
+        if t_pm: filtered_df = filtered_df[(filtered_df['Profit Margin (%)'] >= min_pm_filter) & pd.notna(filtered_df['Profit Margin (%)'])]
+        if t_de: filtered_df = filtered_df[(filtered_df['Debt/Equity'] <= max_de_filter) & pd.notna(filtered_df['Debt/Equity'])]
+        if t_rg: filtered_df = filtered_df[(filtered_df['Rev Growth (%)'] >= min_rg_filter) & pd.notna(filtered_df['Rev Growth (%)'])]
+        if t_dy: filtered_df = filtered_df[(filtered_df['Div Yield (%)'] >= min_dy_filter) & pd.notna(filtered_df['Div Yield (%)'])]
+        if t_beta: filtered_df = filtered_df[(filtered_df['Beta'] <= max_beta_filter) & pd.notna(filtered_df['Beta'])]
+        if t_mc: filtered_df = filtered_df[(filtered_df['Market Cap (B)'] >= min_mc_filter) & pd.notna(filtered_df['Market Cap (B)'])]
+        if t_sh: filtered_df = filtered_df[(filtered_df['Short % Float'] <= max_sh_filter) & pd.notna(filtered_df['Short % Float'])]
+        
+        if t_rmse: filtered_df = filtered_df[filtered_df['Avg Tracking Error (RMSE)'] <= max_rmse]
+        if t_cagr: filtered_df = filtered_df[filtered_df['5-Yr CAGR'] >= min_cagr]
+
+        filtered_df = filtered_df.sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
         
         display_cols = [
             "Ticker", "Current Price", "Year 5 Target", "5-Yr CAGR", 
-            "Current P/E", "PEG Ratio", "P/B Ratio", "ROE (%)", 
-            "Debt/Equity", "Profit Margin (%)", "Avg Tracking Error (RMSE)"
+            "Current P/E", "Rev Growth (%)", "PEG Ratio", "P/S Ratio", 
+            "ROE (%)", "Profit Margin (%)", "Div Yield (%)", "Avg Tracking Error (RMSE)"
         ]
-        
-        # Ensure older caches don't crash if they lack the new columns
-        for col in display_cols:
-            if col not in filtered_df.columns:
-                filtered_df[col] = np.nan
         
         st.write(f"Showing **{len(filtered_df)}** matching profiles.")
         st.dataframe(filtered_df[display_cols].style.format({
-            "Current Price": "${:,.2f}", 
-            "Year 5 Target": "${:,.2f}", 
-            "5-Yr CAGR": "{:+.1f}%", 
-            "Current P/E": "{:.2f}",
-            "PEG Ratio": "{:.2f}",
-            "P/B Ratio": "{:.2f}",
-            "ROE (%)": "{:.1f}%",
-            "Debt/Equity": "{:.1f}",
-            "Profit Margin (%)": "{:.1f}%",
-            "Avg Tracking Error (RMSE)": "±${:,.0f}"
+            "Current Price": "${:,.2f}", "Year 5 Target": "${:,.2f}", "5-Yr CAGR": "{:+.1f}%", 
+            "Current P/E": "{:.2f}", "Rev Growth (%)": "{:.1f}%", "PEG Ratio": "{:.2f}", 
+            "P/S Ratio": "{:.2f}", "ROE (%)": "{:.1f}%", "Profit Margin (%)": "{:.1f}%", 
+            "Div Yield (%)": "{:.2f}%", "Avg Tracking Error (RMSE)": "±${:,.0f}"
         }), use_container_width=True)
