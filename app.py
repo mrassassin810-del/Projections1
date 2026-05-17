@@ -115,7 +115,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
             results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
     else: results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
 
-    # Extreme Outlier Mitigation for Non-Op Only (Keeps math sane for wild one-off taxes)
+    # Extreme Outlier Mitigation for Non-Op Only
     if is_non_op:
         upper_bound = max(0, np.max(y)) * 1.5
         for name in results:
@@ -125,9 +125,18 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
     valid_models = [ (name, data['rmse'], data['forecast']) for name, data in results.items() if data['forecast'] is not None and data['rmse'] != float('inf') ]
     valid_models.sort(key=lambda x: x[1]) 
     
+    current_val = y[-1] if len(y) > 0 else 0
     auto_choice = "Linear" 
+    
     for name, rmse, forecast in valid_models:
-        if is_expense and slope > 0 and forecast[-1] < y[-1] and name not in ["Linear", "Quadratic"]: continue
+        if is_expense and slope > 0 and forecast[-1] < y[-1] and name not in ["Linear", "Quadratic"]: 
+            continue
+            
+        # Overfit Filter: Prevent parabolic models from projecting completely impossible multi-trillion market expansions
+        if name in ["Quadratic", "Derivative", "ARIMA"] and current_val > 0:
+            if forecast[-1] > (current_val * 4) and len(valid_models) > 1:
+                continue # Skip this model for auto-choice, it's overfitting the recent curve
+                
         auto_choice = name
         break
 
@@ -351,7 +360,7 @@ with tab_single:
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
             
-        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
+        st.markdown(md, unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
@@ -418,7 +427,6 @@ with tab_screener:
         st.write("---")
         st.subheader("🎛️ Filter Opportunities")
         
-        # UI Update: Clarified Slider Wording
         max_rmse = st.slider(
             "Forecast Confidence Filter (Max Historical Tracking Error):", 
             min_value=float(df_display['Avg Tracking Error (RMSE)'].min()), 
