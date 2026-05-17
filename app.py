@@ -48,7 +48,7 @@ except:
 
 # --- GLOBAL CONFIG VARIABLES ---
 drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Taxes', 'Shares Outstanding']
-model_choices = ["Auto", "Linear", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
+model_choices = ["Auto", "Linear", "Quadratic", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
 display_order = ['Total Revenue', 'Cost Of Revenue', 'Gross Profit', 'Operating Expense', 'Operating Income', 'Non-Op & Taxes', 'Net Income', 'Shares Outstanding', 'EPS']
 
 # --- CORE MATH ENGINE ---
@@ -65,7 +65,15 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
     results['Linear'] = {'forecast': pred_lin_fut, 'rmse': rmse_lin}
     slope = lin_model.coef_[0]
 
-    # 2. Derivative
+    # 2. Quadratic (Polynomial Degree 2)
+    poly_features = np.column_stack((x_hist, x_hist**2))
+    poly_model = LinearRegression().fit(poly_features, y)
+    poly_fut_features = np.column_stack((x_fut, x_fut**2))
+    pred_poly_fut = np.maximum(floor_val, poly_model.predict(poly_fut_features))
+    rmse_poly = np.sqrt(mean_squared_error(y, poly_model.predict(poly_features)))
+    results['Quadratic'] = {'forecast': pred_poly_fut, 'rmse': rmse_poly}
+
+    # 3. Derivative
     if n >= 4:
         diffs = np.diff(y)
         x_diff = np.arange(len(diffs)).reshape(-1, 1)
@@ -81,7 +89,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
     else:
         results['Derivative'] = {'forecast': None, 'rmse': float('inf')}
 
-    # 3. Logarithmic
+    # 4. Logarithmic
     x_log_hist = np.log(x_hist + 1)
     x_log_fut = np.log(x_fut + 1)
     log_model = LinearRegression().fit(x_log_hist, y)
@@ -89,7 +97,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
     rmse_log = np.sqrt(mean_squared_error(y, log_model.predict(x_log_hist)))
     results['Logarithmic'] = {'forecast': pred_log_fut, 'rmse': rmse_log}
 
-    # 4. Holt-Winters
+    # 5. Holt-Winters
     if n >= 8: 
         try:
             hw_model = ExponentialSmoothing(y, trend='add', seasonal='add', seasonal_periods=4, initialization_method="heuristic").fit()
@@ -98,7 +106,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
             results['Holt-Winters'] = {'forecast': None, 'rmse': float('inf')}
     else: results['Holt-Winters'] = {'forecast': None, 'rmse': float('inf')}
 
-    # 5. ARIMA
+    # 6. ARIMA
     if n >= 6:
         try:
             arima_model = ARIMA(y, order=(1, 1, 1), enforce_stationarity=False, enforce_invertibility=False).fit()
@@ -107,8 +115,9 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
             results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
     else: results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
 
+    # Extreme Outlier Mitigation for Non-Op Only (Keeps math sane for wild one-off taxes)
     if is_non_op:
-        upper_bound = max(0, np.max(y)) * 1.2
+        upper_bound = max(0, np.max(y)) * 1.5
         for name in results:
             if results[name]['forecast'] is not None:
                 results[name]['forecast'] = np.minimum(results[name]['forecast'], upper_bound)
@@ -118,7 +127,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
     
     auto_choice = "Linear" 
     for name, rmse, forecast in valid_models:
-        if is_expense and slope > 0 and forecast[-1] < y[-1] and name != "Linear": continue
+        if is_expense and slope > 0 and forecast[-1] < y[-1] and name not in ["Linear", "Quadratic"]: continue
         auto_choice = name
         break
 
@@ -152,19 +161,23 @@ def process_single_screener_stock(ticker, target_pe):
         if len(norm_df) < 5: return None
 
         x_hist, x_fut = np.arange(len(norm_df)).reshape(-1, 1), np.arange(len(norm_df), len(norm_df) + 20).reshape(-1, 1)
-        total_rmse, proj_5y = 0, {}
+        total_rmse = 0
+        q_proj = {}
 
         for metric in drivers:
             y = norm_df[metric].values
             res = calculate_metric_models(y, x_hist, x_fut, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes')
             winning_model = res['AutoChoice']
             total_rmse += res[winning_model]['rmse']
-            q_forecast = res[winning_model]['forecast']
-            proj_5y[metric] = np.mean(q_forecast[16:20]) if metric == 'Shares Outstanding' else np.sum(q_forecast[16:20])
+            q_proj[metric] = res[winning_model]['forecast']
 
-        net_income_5y = (proj_5y['Total Revenue'] - proj_5y['Cost Of Revenue']) - proj_5y['Operating Expense'] + proj_5y['Non-Op & Taxes']
-        eps_5y = net_income_5y / proj_5y['Shares Outstanding'] if proj_5y['Shares Outstanding'] else 0
-        target_price_5y = eps_5y * target_pe
+        q_proj['Gross Profit'] = q_proj['Total Revenue'] - q_proj['Cost Of Revenue']
+        q_proj['Operating Income'] = q_proj['Gross Profit'] - q_proj['Operating Expense']
+        q_proj['Net Income'] = q_proj['Operating Income'] + q_proj['Non-Op & Taxes']
+        q_proj['Shares Outstanding'] = np.maximum(1, q_proj['Shares Outstanding'])
+
+        eps_5y_avg = np.sum(q_proj['Net Income'][16:20]) / np.mean(q_proj['Shares Outstanding'][16:20])
+        target_price_5y = eps_5y_avg * target_pe
 
         hist_1d = stock.history(period="1d")
         current_p = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
@@ -198,7 +211,6 @@ with tab_single:
             error_found, use_yf = False, True
             stock = yf.Ticker(ticker_input)
             
-            # --- ALPHA VANTAGE SECRETS PULL ---
             if api_key:
                 try:
                     r = requests.get(f'https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={ticker_input}&apikey={api_key}').json()
@@ -227,7 +239,6 @@ with tab_single:
                     else: st.warning("Alpha Vantage limit reached. Falling back to Yahoo Finance...")
                 except: st.warning(f"Alpha Vantage Error. Falling back to Yahoo Finance...")
 
-            # --- YFINANCE FALLBACK ---
             if use_yf:
                 try:
                     df = stock.quarterly_income_stmt.T
@@ -279,6 +290,7 @@ with tab_single:
         
         depth_color = "green" if len(df_reg) >= 8 else "red"
         st.markdown(f"**Data Depth Indicator:** :{depth_color}[{len(df_reg)} Quarters Loaded] via {st.session_state.data_source} *(Note: ARIMA/Holt-Winters require 6-8 minimum)*")
+        if not api_key: st.info("💡 **Want deeper data?** Add a free Alpha Vantage API key to your Streamlit Secrets.")
         
         x_historical, x_future = np.arange(len(df_reg)).reshape(-1, 1), np.arange(len(df_reg), len(df_reg) + 20).reshape(-1, 1) 
         
@@ -300,17 +312,17 @@ with tab_single:
             
             proj_quarterly_data[metric] = res[act]['forecast']
             errors[metric], methods[metric] = res[act]['rmse'], f"Auto: {act}" if st.session_state[f"ov_{metric}"] == "Auto" else f"Manual: {act}"
-            proj_annual_data[metric] = [np.mean(res[act]['forecast'][i*4:(i+1)*4]) if metric == 'Shares Outstanding' else np.sum(res[act]['forecast'][i*4:(i+1)*4]) for i in range(5)]
-
-        proj_annual_data['Gross Profit'] = (np.array(proj_annual_data['Total Revenue']) - np.array(proj_annual_data['Cost Of Revenue'])).tolist()
-        proj_annual_data['Operating Income'] = (np.array(proj_annual_data['Gross Profit']) - np.array(proj_annual_data['Operating Expense'])).tolist()
-        proj_annual_data['Net Income'] = (np.array(proj_annual_data['Operating Income']) + np.array(proj_annual_data['Non-Op & Taxes'])).tolist()
-        proj_annual_data['EPS'] = (np.array(proj_annual_data['Net Income']) / np.array(proj_annual_data['Shares Outstanding'])).tolist()
 
         proj_quarterly_data['Gross Profit'] = proj_quarterly_data['Total Revenue'] - proj_quarterly_data['Cost Of Revenue']
         proj_quarterly_data['Operating Income'] = proj_quarterly_data['Gross Profit'] - proj_quarterly_data['Operating Expense']
         proj_quarterly_data['Net Income'] = proj_quarterly_data['Operating Income'] + proj_quarterly_data['Non-Op & Taxes']
-        proj_quarterly_data['EPS'] = proj_quarterly_data['Net Income'] / proj_quarterly_data['Shares Outstanding']
+        proj_quarterly_data['Shares Outstanding'] = np.maximum(1, proj_quarterly_data['Shares Outstanding'])
+
+        for metric in display_order:
+            if metric == 'Shares Outstanding': proj_annual_data[metric] = [np.mean(proj_quarterly_data[metric][i*4:(i+1)*4]) for i in range(5)]
+            elif metric == 'EPS': pass 
+            else: proj_annual_data[metric] = [np.sum(proj_quarterly_data[metric][i*4:(i+1)*4]) for i in range(5)]
+        proj_annual_data['EPS'] = (np.array(proj_annual_data['Net Income']) / np.array(proj_annual_data['Shares Outstanding'])).tolist()
 
         hist_labels, hist_data = [], {m: [] for m in display_order}
         num_q = len(norm_df)
@@ -406,7 +418,14 @@ with tab_screener:
         st.write("---")
         st.subheader("🎛️ Filter Opportunities")
         
-        max_rmse = st.slider("Max Avg Tracking Error Allowed (RMSE):", float(df_display['Avg Tracking Error (RMSE)'].min()), float(df_display['Avg Tracking Error (RMSE)'].max()), float(df_display['Avg Tracking Error (RMSE)'].max() * 0.4))
+        # UI Update: Clarified Slider Wording
+        max_rmse = st.slider(
+            "Forecast Confidence Filter (Max Historical Tracking Error):", 
+            min_value=float(df_display['Avg Tracking Error (RMSE)'].min()), 
+            max_value=float(df_display['Avg Tracking Error (RMSE)'].max()), 
+            value=float(df_display['Avg Tracking Error (RMSE)'].max() * 0.4),
+            help="Acts as a confidence interval. Lowering this strictness filters out unpredictable stocks, leaving only those that historically track their regression curves tightly."
+        )
         min_cagr = st.slider("Minimum Acceptable 5-Yr CAGR (%):", float(df_display['5-Yr CAGR'].min()), float(df_display['5-Yr CAGR'].max()), 12.0)
 
         filtered_df = df_display[(df_display['Avg Tracking Error (RMSE)'] <= max_rmse) & (df_display['5-Yr CAGR'] >= min_cagr)].sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
