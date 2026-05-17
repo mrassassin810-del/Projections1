@@ -3,13 +3,13 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 import altair as alt
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Attempt to load advanced stats models
 try:
     from statsmodels.tsa.holtwinters import ExponentialSmoothing
     from statsmodels.tsa.arima.model import ARIMA
@@ -30,73 +30,65 @@ drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Ta
 model_choices = ["Auto", "Linear", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
 display_order = ['Total Revenue', 'Cost Of Revenue', 'Gross Profit', 'Operating Expense', 'Operating Income', 'Non-Op & Taxes', 'Net Income', 'Shares Outstanding', 'EPS']
 
+# --- SIDEBAR: API INTEGRATION ---
+st.sidebar.header("🔌 Deep Data Integration")
+st.sidebar.write("Yahoo Finance limits free data to 4-5 quarters. To unlock 5+ years of data for the **ARIMA** and **Holt-Winters** models, paste a free Alpha Vantage API key below.")
+api_key = st.sidebar.text_input("Alpha Vantage API Key:", type="password")
+st.sidebar.markdown("[Get a free key here](https://www.alphavantage.co/support/#api-key)")
+st.sidebar.caption("Note: Free keys have a 25 request/day limit. The S&P 500 Screener will automatically ignore this key and use Yahoo Finance to prevent account limits.")
+
 # --- CORE MATH ENGINE ---
 def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False, is_non_op=False):
     n = len(y)
     results = {}
     floor_val = 1 if is_shares else 0
 
-    # 1. Base Linear Model
+    # 1. Base Linear
     lin_model = LinearRegression().fit(x_hist, y)
     pred_lin_fut = np.maximum(floor_val, lin_model.predict(x_fut))
-    pred_lin_hist = lin_model.predict(x_hist)
-    slope = lin_model.coef_[0]
-    rmse_lin = np.sqrt(mean_squared_error(y, pred_lin_hist))
+    rmse_lin = np.sqrt(mean_squared_error(y, lin_model.predict(x_hist)))
     results['Linear'] = {'forecast': pred_lin_fut, 'rmse': rmse_lin}
+    slope = lin_model.coef_[0]
 
-    # 2. Derivative Model
+    # 2. Derivative
     if n >= 4:
         diffs = np.diff(y)
         x_diff = np.arange(len(diffs)).reshape(-1, 1)
         deriv_model = LinearRegression().fit(x_diff, diffs)
         x_diff_fut = np.arange(len(diffs), len(diffs) + 20).reshape(-1, 1)
         fut_diffs = deriv_model.predict(x_diff_fut)
-
-        forecast_deriv = []
-        current_val = y[-1]
+        forecast_deriv, current_val = [], y[-1]
         for fd in fut_diffs:
             current_val = max(floor_val, current_val + fd)
             forecast_deriv.append(current_val)
-            
-        pred_deriv_hist = y[:-1] + deriv_model.predict(x_diff)
-        rmse_deriv = np.sqrt(mean_squared_error(y[1:], pred_deriv_hist))
+        rmse_deriv = np.sqrt(mean_squared_error(y[1:], y[:-1] + deriv_model.predict(x_diff)))
         results['Derivative'] = {'forecast': np.array(forecast_deriv), 'rmse': rmse_deriv}
     else:
         results['Derivative'] = {'forecast': None, 'rmse': float('inf')}
 
-    # 3. Logarithmic Model
+    # 3. Logarithmic
     x_log_hist = np.log(x_hist + 1)
     x_log_fut = np.log(x_fut + 1)
     log_model = LinearRegression().fit(x_log_hist, y)
     pred_log_fut = np.maximum(floor_val, log_model.predict(x_log_fut))
-    pred_log_hist = log_model.predict(x_log_hist)
-    rmse_log = np.sqrt(mean_squared_error(y, pred_log_hist))
+    rmse_log = np.sqrt(mean_squared_error(y, log_model.predict(x_log_hist)))
     results['Logarithmic'] = {'forecast': pred_log_fut, 'rmse': rmse_log}
 
     # 4. Holt-Winters
     if n >= 8: 
         try:
             hw_model = ExponentialSmoothing(y, trend='add', seasonal='add', seasonal_periods=4, initialization_method="estimated").fit()
-            pred_hw_fut = np.maximum(floor_val, hw_model.forecast(20))
-            rmse_hw = np.sqrt(mean_squared_error(y, hw_model.fittedvalues))
-            results['Holt-Winters'] = {'forecast': pred_hw_fut, 'rmse': rmse_hw}
-        except:
-            results['Holt-Winters'] = {'forecast': None, 'rmse': float('inf')}
-    else:
-        results['Holt-Winters'] = {'forecast': None, 'rmse': float('inf')}
+            results['Holt-Winters'] = {'forecast': np.maximum(floor_val, hw_model.forecast(20)), 'rmse': np.sqrt(mean_squared_error(y, hw_model.fittedvalues))}
+        except: results['Holt-Winters'] = {'forecast': None, 'rmse': float('inf')}
+    else: results['Holt-Winters'] = {'forecast': None, 'rmse': float('inf')}
 
     # 5. ARIMA
     if n >= 6:
         try:
             arima_model = ARIMA(y, order=(1, 1, 1)).fit()
-            pred_arima_fut = np.maximum(floor_val, arima_model.forecast(20))
-            pred_arima_hist = arima_model.predict(start=0, end=len(y)-1)
-            rmse_arima = np.sqrt(mean_squared_error(y, pred_arima_hist))
-            results['ARIMA'] = {'forecast': pred_arima_fut, 'rmse': rmse_arima}
-        except:
-            results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
-    else:
-        results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
+            results['ARIMA'] = {'forecast': np.maximum(floor_val, arima_model.forecast(20)), 'rmse': np.sqrt(mean_squared_error(y, arima_model.predict(start=0, end=len(y)-1)))}
+        except: results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
+    else: results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
 
     if is_non_op:
         upper_bound = max(0, np.max(y)) * 1.2
@@ -104,17 +96,12 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
             if results[name]['forecast'] is not None:
                 results[name]['forecast'] = np.minimum(results[name]['forecast'], upper_bound)
 
-    valid_models = []
-    for name, data in results.items():
-        if data['forecast'] is not None and data['rmse'] != float('inf'):
-            valid_models.append((name, data['rmse'], data['forecast']))
-    
+    valid_models = [ (name, data['rmse'], data['forecast']) for name, data in results.items() if data['forecast'] is not None and data['rmse'] != float('inf') ]
     valid_models.sort(key=lambda x: x[1]) 
     
     auto_choice = "Linear" 
     for name, rmse, forecast in valid_models:
-        if is_expense and slope > 0 and forecast[-1] < y[-1] and name != "Linear":
-            continue
+        if is_expense and slope > 0 and forecast[-1] < y[-1] and name != "Linear": continue
         auto_choice = name
         break
 
@@ -144,18 +131,11 @@ def process_single_screener_stock(ticker, target_pe):
         elif 'Basic Average Shares' in df_raw.columns: shares = df_raw['Basic Average Shares']
         else: return None
 
-        norm_df = pd.DataFrame({
-            'Total Revenue': rev, 'Cost Of Revenue': cogs, 'Operating Expense': opex,
-            'Non-Op & Taxes': non_op_taxes, 'Shares Outstanding': shares, 'Net Income': ni
-        }).dropna()
-
+        norm_df = pd.DataFrame({'Total Revenue': rev, 'Cost Of Revenue': cogs, 'Operating Expense': opex, 'Non-Op & Taxes': non_op_taxes, 'Shares Outstanding': shares, 'Net Income': ni}).dropna()
         if len(norm_df) < 5: return None
 
-        x_hist = np.arange(len(norm_df)).reshape(-1, 1)
-        x_fut = np.arange(len(norm_df), len(norm_df) + 20).reshape(-1, 1)
-
-        total_rmse = 0
-        proj_5y = {}
+        x_hist, x_fut = np.arange(len(norm_df)).reshape(-1, 1), np.arange(len(norm_df), len(norm_df) + 20).reshape(-1, 1)
+        total_rmse, proj_5y = 0, {}
 
         for metric in drivers:
             y = norm_df[metric].values
@@ -163,9 +143,7 @@ def process_single_screener_stock(ticker, target_pe):
             winning_model = res['AutoChoice']
             total_rmse += res[winning_model]['rmse']
             q_forecast = res[winning_model]['forecast']
-
-            if metric == 'Shares Outstanding': proj_5y[metric] = np.mean(q_forecast[16:20])
-            else: proj_5y[metric] = np.sum(q_forecast[16:20])
+            proj_5y[metric] = np.mean(q_forecast[16:20]) if metric == 'Shares Outstanding' else np.sum(q_forecast[16:20])
 
         net_income_5y = (proj_5y['Total Revenue'] - proj_5y['Cost Of Revenue']) - proj_5y['Operating Expense'] + proj_5y['Non-Op & Taxes']
         eps_5y = net_income_5y / proj_5y['Shares Outstanding'] if proj_5y['Shares Outstanding'] else 0
@@ -176,11 +154,9 @@ def process_single_screener_stock(ticker, target_pe):
 
         if current_p <= 0 or target_price_5y <= 0: return None
         cagr = (target_price_5y / current_p) ** (1/5) - 1
-        avg_rmse = total_rmse / len(drivers)
 
-        return {"Ticker": ticker, "Current Price": round(current_p, 2), "Year 5 Target": round(target_price_5y, 2), "5-Yr CAGR": round(cagr * 100, 2), "Avg Tracking Error (RMSE)": round(avg_rmse, 2)}
-    except:
-        return None
+        return {"Ticker": ticker, "Current Price": round(current_p, 2), "Year 5 Target": round(target_price_5y, 2), "5-Yr CAGR": round(cagr * 100, 2), "Avg Tracking Error (RMSE)": round(total_rmse / len(drivers), 2)}
+    except: return None
 
 # --- UI APP TABS ---
 tab_single, tab_screener = st.tabs(["📊 Single Ticker Forecast", "🔍 S&P 500 Screening Dashboard"])
@@ -191,8 +167,7 @@ with tab_single:
         if f"ov_{m}" not in st.session_state: st.session_state[f"ov_{m}"] = "Auto"
 
     def reset_overrides():
-        for m in drivers:
-            st.session_state[f"ov_{m}"] = "Auto"
+        for m in drivers: st.session_state[f"ov_{m}"] = "Auto"
 
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1: ticker_input = st.text_input("Enter Ticker:", "PLTR", key="single_tick").upper()
@@ -202,48 +177,81 @@ with tab_single:
         analyze_btn = st.button("Fetch & Analyze", key="single_btn", use_container_width=True)
 
     if analyze_btn:
-        with st.spinner(f"Analyzing {ticker_input}..."):
-            error_found = False
-            try:
-                stock = yf.Ticker(ticker_input)
-                df = stock.quarterly_income_stmt.T
-                if df.empty: df = stock.quarterly_financials.T
-                
-                if df.empty:
-                    st.error(f"No financial data found for {ticker_input}.")
-                    error_found = True
-                else:
-                    df.index = pd.to_datetime(df.index)
-                    df = df.sort_index()
-                    if 'Total Revenue' not in df.columns:
-                        st.error("Total Revenue data missing.")
-                        error_found = True
-                    else:
-                        df_raw = df / 1000
-                        rev = df_raw['Total Revenue']
-                        gp = df_raw['Gross Profit'] if 'Gross Profit' in df_raw.columns else rev
-                        cogs = rev - gp
-                        op_inc = df_raw['Operating Income'] if 'Operating Income' in df_raw.columns else gp
-                        opex = gp - op_inc
-                        ni = df_raw['Net Income'] if 'Net Income' in df_raw.columns else op_inc
-                        non_op_taxes = ni - op_inc 
-                        
-                        if 'Diluted Average Shares' in df_raw.columns: shares = df_raw['Diluted Average Shares']
-                        elif 'Basic Average Shares' in df_raw.columns: shares = df_raw['Basic Average Shares']
-                        else: shares = pd.Series(1, index=df_raw.index)
+        with st.spinner(f"Mining data for {ticker_input}..."):
+            error_found, use_yf = False, True
+            stock = yf.Ticker(ticker_input)
+            
+            # --- ALPHA VANTAGE OVERRIDE ---
+            if api_key:
+                try:
+                    r = requests.get(f'https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={ticker_input}&apikey={api_key}').json()
+                    if 'quarterlyReports' in r:
+                        use_yf = False
+                        df_av = pd.DataFrame(r['quarterlyReports'])
+                        df_av['fiscalDateEnding'] = pd.to_datetime(df_av['fiscalDateEnding'])
+                        df_av = df_av.set_index('fiscalDateEnding').sort_index()
 
+                        for col in ['totalRevenue', 'costOfRevenue', 'grossProfit', 'operatingIncome', 'netIncome']:
+                            df_av[col] = pd.to_numeric(df_av[col], errors='coerce').fillna(0) / 1000
+
+                        rev, cogs, gp, op_inc, ni = df_av['totalRevenue'], df_av['costOfRevenue'], df_av['grossProfit'], df_av['operatingIncome'], df_av['netIncome']
+                        
+                        shares = pd.Series(stock.info.get('sharesOutstanding', 100000) / 1000, index=df_av.index)
+                        
                         st.session_state.norm_df = pd.DataFrame({
-                            'Total Revenue': rev, 'Cost Of Revenue': cogs, 'Gross Profit': gp, 'Operating Expense': opex,
-                            'Operating Income': op_inc, 'Non-Op & Taxes': non_op_taxes, 'Net Income': ni, 'Shares Outstanding': shares, 'EPS': ni / shares
+                            'Total Revenue': rev, 'Cost Of Revenue': cogs, 'Gross Profit': gp, 'Operating Expense': gp - op_inc,
+                            'Operating Income': op_inc, 'Non-Op & Taxes': ni - op_inc, 'Net Income': ni, 'Shares Outstanding': shares, 'EPS': ni / shares
                         }).dropna()
                         
                         hist_1d = stock.history(period="1d")
                         st.session_state.current_price = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
                         st.session_state.ticker_analyzed = ticker_input
                         st.session_state.actual_lookback = lookback_input
-            except Exception as e:
-                st.error(f"Error processing data: {e}")
-                error_found = True
+                    else: st.warning("Alpha Vantage limit reached or invalid key. Falling back to Yahoo Finance...")
+                except: st.warning(f"Alpha Vantage Error. Falling back to Yahoo Finance...")
+
+            # --- YFINANCE FALLBACK (Deep Mining) ---
+            if use_yf:
+                try:
+                    df = stock.quarterly_income_stmt.T
+                    if len(df) < 8:
+                        df_alt = stock.quarterly_financials.T
+                        if len(df_alt) > len(df): df = df_alt
+                    if len(df) < 8:
+                        try:
+                            df_get = stock.get_income_stmt(freq="quarterly").T
+                            if len(df_get) > len(df): df = df_get
+                        except: pass
+                    
+                    if df.empty or 'Total Revenue' not in df.columns:
+                        st.error(f"No financial data found for {ticker_input}.")
+                        error_found = True
+                    else:
+                        df.index = pd.to_datetime(df.index)
+                        df = df.sort_index()
+                        df_raw = df / 1000
+                        rev = df_raw['Total Revenue']
+                        gp = df_raw['Gross Profit'] if 'Gross Profit' in df_raw.columns else rev
+                        op_inc = df_raw['Operating Income'] if 'Operating Income' in df_raw.columns else gp
+                        ni = df_raw['Net Income'] if 'Net Income' in df_raw.columns else op_inc
+                        
+                        if 'Diluted Average Shares' in df_raw.columns: shares = df_raw['Diluted Average Shares']
+                        elif 'Basic Average Shares' in df_raw.columns: shares = df_raw['Basic Average Shares']
+                        else: shares = pd.Series(1, index=df_raw.index)
+
+                        st.session_state.norm_df = pd.DataFrame({
+                            'Total Revenue': rev, 'Cost Of Revenue': rev - gp, 'Gross Profit': gp, 'Operating Expense': gp - op_inc,
+                            'Operating Income': op_inc, 'Non-Op & Taxes': ni - op_inc, 'Net Income': ni, 'Shares Outstanding': shares, 'EPS': ni / shares
+                        }).dropna()
+                        
+                        hist_1d = stock.history(period="1d")
+                        st.session_state.current_price = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
+                        st.session_state.ticker_analyzed = ticker_input
+                        st.session_state.actual_lookback = lookback_input
+                except Exception as e:
+                    st.error(f"Error processing data: {e}")
+                    error_found = True
+            
             if error_found: st.stop()
 
     if 'norm_df' in st.session_state and st.session_state.ticker_analyzed == ticker_input:
@@ -251,8 +259,7 @@ with tab_single:
         current_price = st.session_state.current_price
         df_reg = norm_df.tail(len(norm_df) if st.session_state.actual_lookback == 0 else st.session_state.actual_lookback)
         
-        x_historical = np.arange(len(df_reg)).reshape(-1, 1)
-        x_future = np.arange(len(df_reg), len(df_reg) + 20).reshape(-1, 1) 
+        x_historical, x_future = np.arange(len(df_reg)).reshape(-1, 1), np.arange(len(df_reg), len(df_reg) + 20).reshape(-1, 1) 
         
         metric_results = {}
         for metric in drivers:
@@ -358,9 +365,7 @@ with tab_screener:
 
         progress_bar = st.progress(0)
         status_text = st.empty()
-        screened_results = []
-        completed = 0
-        total_stocks = len(tickers)
+        screened_results, completed, total_stocks = [], 0, len(tickers)
 
         with ThreadPoolExecutor(max_workers=15) as executor:
             future_to_ticker = {executor.submit(process_single_screener_stock, t, screener_pe): t for t in tickers}
