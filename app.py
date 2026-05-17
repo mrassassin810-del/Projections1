@@ -53,8 +53,8 @@ drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Ta
 model_choices = ["Auto", "Linear", "Quadratic", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
 display_order = ['Total Revenue', 'Cost Of Revenue', 'Gross Profit', 'Operating Expense', 'Operating Income', 'Non-Op & Taxes', 'Net Income', 'Shares Outstanding', 'EPS']
 
-# --- DECOUPLED DATA PIPELINE ---
-def fetch_financial_data(ticker, force_deep_dive=False):
+# --- DECOUPLED DATA PIPELINE (QUARTERLY FOR TAB 1) ---
+def fetch_quarterly_financials(ticker):
     stock = yf.Ticker(ticker)
     use_yf = True
     df_final = pd.DataFrame()
@@ -62,9 +62,8 @@ def fetch_financial_data(ticker, force_deep_dive=False):
     
     hist_1d = stock.history(period="1d")
     current_price = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
-    analyst_target = stock.info.get('targetMeanPrice', np.nan)
 
-    if force_deep_dive and api_key:
+    if api_key:
         try:
             r = requests.get(f'https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={ticker}&apikey={api_key}').json()
             if 'quarterlyReports' in r:
@@ -106,10 +105,10 @@ def fetch_financial_data(ticker, force_deep_dive=False):
                 data_source = "Yahoo Finance (Standard)"
         except: pass
         
-    return df_final, current_price, analyst_target, data_source
+    return df_final, current_price, data_source
 
 # --- CORE MATH ENGINE WITH REJECTION RULES ---
-def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
+def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative=False):
     y = np.asarray(y_in, dtype=float)
     n = len(y)
     results = {}
@@ -121,23 +120,22 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
     rmse_lin = np.sqrt(mean_squared_error(y, lin_model.predict(x_hist)))
     results['Linear'] = {'forecast': pred_lin_fut, 'rmse': rmse_lin}
 
-    # 2. Quadratic (DISABLED for < 6 data points to prevent parabolic hyper-inflation)
-    if n >= 6:
+    # 2. Quadratic
+    if n >= 4:
         poly_features = np.column_stack((x_hist, x_hist**2))
         poly_model = LinearRegression().fit(poly_features, y)
         poly_fut_features = np.column_stack((x_fut, x_fut**2))
         pred_poly_fut = np.maximum(floor_val, poly_model.predict(poly_fut_features))
         rmse_poly = np.sqrt(mean_squared_error(y, poly_model.predict(poly_features)))
         results['Quadratic'] = {'forecast': pred_poly_fut, 'rmse': rmse_poly}
-    else:
-        results['Quadratic'] = {'forecast': None, 'rmse': float('inf')}
+    else: results['Quadratic'] = {'forecast': None, 'rmse': float('inf')}
 
-    # 3. Derivative (Requires 5 points to build 4 stable differentials)
-    if n >= 5:
+    # 3. Derivative
+    if n >= 4:
         diffs = np.diff(y)
         x_diff = np.arange(len(diffs)).reshape(-1, 1)
         deriv_model = LinearRegression().fit(x_diff, diffs)
-        x_diff_fut = np.arange(len(diffs), len(diffs) + 20).reshape(-1, 1)
+        x_diff_fut = np.arange(len(diffs), len(diffs) + len(x_fut)).reshape(-1, 1)
         fut_diffs = deriv_model.predict(x_diff_fut)
         forecast_deriv, current_val = [], y[-1]
         for fd in fut_diffs:
@@ -160,7 +158,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
     if n >= 8: 
         try:
             hw_model = ExponentialSmoothing(y, trend='add', seasonal='add', seasonal_periods=4, initialization_method="heuristic").fit()
-            results['Holt-Winters'] = {'forecast': np.maximum(floor_val, hw_model.forecast(20)), 'rmse': np.sqrt(mean_squared_error(y, hw_model.fittedvalues))}
+            results['Holt-Winters'] = {'forecast': np.maximum(floor_val, hw_model.forecast(len(x_fut))), 'rmse': np.sqrt(mean_squared_error(y, hw_model.fittedvalues))}
         except Exception: 
             results['Holt-Winters'] = {'forecast': None, 'rmse': float('inf')}
     else: results['Holt-Winters'] = {'forecast': None, 'rmse': float('inf')}
@@ -169,7 +167,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
     if n >= 6:
         try:
             arima_model = ARIMA(y, order=(1, 1, 1), enforce_stationarity=False, enforce_invertibility=False).fit()
-            results['ARIMA'] = {'forecast': np.maximum(floor_val, arima_model.forecast(20)), 'rmse': np.sqrt(mean_squared_error(y, arima_model.predict(start=0, end=len(y)-1)))}
+            results['ARIMA'] = {'forecast': np.maximum(floor_val, arima_model.forecast(len(x_fut))), 'rmse': np.sqrt(mean_squared_error(y, arima_model.predict(start=0, end=len(y)-1)))}
         except Exception: 
             results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
     else: results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
@@ -181,6 +179,11 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
                 results[name]['forecast'] = np.minimum(results[name]['forecast'], upper_bound)
 
     valid_models = [ (name, data['rmse'], data['forecast']) for name, data in results.items() if data['forecast'] is not None and data['rmse'] != float('inf') ]
+    
+    # Analyst Reality Check Downgrade
+    if force_conservative:
+        valid_models = [m for m in valid_models if m[0] in ["Linear", "Logarithmic"]]
+
     valid_models.sort(key=lambda x: x[1]) 
     
     current_val = y[-1] if len(y) > 0 else 0
@@ -204,9 +207,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
         if is_valid:
             safe_models.append(name)
 
-    # Fallback to pure stability if all models flag as dangerously volatile
-    if safe_models:
-        auto_choice = safe_models[0]
+    if safe_models: auto_choice = safe_models[0]
     else:
         if "Logarithmic" in [m[0] for m in valid_models]: auto_choice = "Logarithmic"
         else: auto_choice = "Linear"
@@ -214,44 +215,85 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name):
     results['AutoChoice'] = auto_choice
     return results
 
-# --- BACKGROUND WORKER FOR SCREENER ---
+# --- BACKGROUND WORKER FOR SCREENER (ANNUAL DATA ONLY) ---
 def process_single_screener_stock(ticker):
-    norm_df, current_p, analyst_target, _ = fetch_financial_data(ticker, force_deep_dive=False)
-    
-    # Lowered threshold to 4 to prevent Yahoo Finance free-tier rejections
-    if norm_df.empty or len(norm_df) < 4: return None
+    try:
+        stock = yf.Ticker(ticker)
+        
+        # 1. Pull ANNUAL data for the screener for stable horizon planning
+        df = stock.income_stmt.T
+        if df.empty: df = stock.financials.T
+        if df.empty or 'Total Revenue' not in df.columns: return None
 
-    x_hist, x_fut = np.arange(len(norm_df)).reshape(-1, 1), np.arange(len(norm_df), len(norm_df) + 20).reshape(-1, 1)
-    total_rmse = 0
-    q_proj = {}
+        df = df.sort_index()
+        df_raw = df / 1000
 
-    for metric in drivers:
-        y = norm_df[metric].values
-        res = calculate_metric_models(y, x_hist, x_fut, metric)
-        winning_model = res['AutoChoice']
-        total_rmse += res[winning_model]['rmse']
-        q_proj[metric] = res[winning_model]['forecast']
+        rev = df_raw['Total Revenue']
+        gp = df_raw['Gross Profit'] if 'Gross Profit' in df_raw.columns else rev
+        cogs = rev - gp
+        op_inc = df_raw['Operating Income'] if 'Operating Income' in df_raw.columns else gp
+        opex = gp - op_inc
+        ni = df_raw['Net Income'] if 'Net Income' in df_raw.columns else op_inc
+        non_op_taxes = ni - op_inc
 
-    q_proj['Gross Profit'] = q_proj['Total Revenue'] - q_proj['Cost Of Revenue']
-    q_proj['Operating Income'] = q_proj['Gross Profit'] - q_proj['Operating Expense']
-    q_proj['Net Income'] = q_proj['Operating Income'] + q_proj['Non-Op & Taxes']
+        if 'Diluted Average Shares' in df_raw.columns: shares = df_raw['Diluted Average Shares']
+        elif 'Basic Average Shares' in df_raw.columns: shares = df_raw['Basic Average Shares']
+        else: return None
 
-    eps_5y_avg = np.sum(q_proj['Net Income'][16:20]) / np.mean(q_proj['Shares Outstanding'][16:20])
-    
-    if current_p <= 0 or eps_5y_avg <= 0: return None
+        norm_df = pd.DataFrame({'Total Revenue': rev, 'Cost Of Revenue': cogs, 'Operating Expense': opex, 'Non-Op & Taxes': non_op_taxes, 'Shares Outstanding': shares, 'Net Income': ni}).dropna()
+        if len(norm_df) < 3: return None # Require 3 years minimum
 
-    return {
-        "Ticker": ticker, 
-        "Current Price": round(current_p, 2), 
-        "Analyst Target": round(analyst_target, 2) if pd.notna(analyst_target) else None,
-        "Year 5 EPS": eps_5y_avg, 
-        "Avg Tracking Error (RMSE)": round(total_rmse / len(drivers), 2)
-    }
+        # 2. Get Wall St 1-Year Forward Consensus silently
+        try: f_eps = stock.info.get('forwardEps', np.nan)
+        except: f_eps = np.nan
+            
+        hist_1d = stock.history(period="1d")
+        current_p = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
+
+        # Project 5 periods (years) forward
+        x_hist = np.arange(len(norm_df)).reshape(-1, 1)
+        x_fut = np.arange(len(norm_df), len(norm_df) + 5).reshape(-1, 1)
+
+        def run_annual_projections(conservative=False):
+            q_proj, rmse_tot = {}, 0
+            for metric in drivers:
+                res = calculate_metric_models(norm_df[metric].values, x_hist, x_fut, metric, force_conservative=conservative)
+                winning_model = res['AutoChoice']
+                rmse_tot += res[winning_model]['rmse']
+                q_proj[metric] = res[winning_model]['forecast']
+
+            q_proj['Gross Profit'] = q_proj['Total Revenue'] - q_proj['Cost Of Revenue']
+            q_proj['Operating Income'] = q_proj['Gross Profit'] - q_proj['Operating Expense']
+            q_proj['Net Income'] = q_proj['Operating Income'] + q_proj['Non-Op & Taxes']
+            return q_proj, rmse_tot
+
+        # PASS 1: Base Mathematical Projections
+        proj, total_rmse = run_annual_projections(conservative=False)
+        
+        eps_y1 = proj['Net Income'][0] / max(1, proj['Shares Outstanding'][0])
+        
+        # PASS 2: Invisible Analyst Sanity Check
+        # If the math predicts Year 1 will be radically different than consensus, force the models to linear/log
+        if pd.notna(f_eps) and f_eps > 0 and eps_y1 > 0:
+            if eps_y1 > (f_eps * 2.5) or eps_y1 < (f_eps * 0.4):
+                proj, total_rmse = run_annual_projections(conservative=True)
+
+        eps_5y_target = proj['Net Income'][-1] / max(1, proj['Shares Outstanding'][-1])
+        
+        if current_p <= 0 or eps_5y_target <= 0: return None
+
+        return {
+            "Ticker": ticker, 
+            "Current Price": round(current_p, 2), 
+            "Year 5 EPS": eps_5y_target, 
+            "Avg Tracking Error (RMSE)": round(total_rmse / len(drivers), 2)
+        }
+    except: return None
 
 # --- UI APP TABS ---
 tab_single, tab_screener = st.tabs(["📊 Single Ticker Forecast", "🔍 S&P 500 Screening Dashboard"])
 
-# ================= TAB 1: SINGLE FORECASTER =================
+# ================= TAB 1: SINGLE FORECASTER (QUARTERLY) =================
 with tab_single:
     for m in drivers:
         if f"ov_{m}" not in st.session_state: st.session_state[f"ov_{m}"] = "Auto"
@@ -268,14 +310,13 @@ with tab_single:
 
     if analyze_btn:
         with st.spinner(f"Executing Deep Data Mine for {ticker_input}..."):
-            norm_df, current_price, analyst_target, data_source = fetch_financial_data(ticker_input, force_deep_dive=True)
+            norm_df, current_price, data_source = fetch_quarterly_financials(ticker_input)
             if norm_df.empty:
                 st.error(f"No financial data found for {ticker_input}.")
                 st.stop()
             else:
                 st.session_state.norm_df = norm_df
                 st.session_state.current_price = current_price
-                st.session_state.analyst_target_tab1 = analyst_target
                 st.session_state.ticker_analyzed = ticker_input
                 st.session_state.actual_lookback = lookback_input
                 st.session_state.data_source = data_source
@@ -351,13 +392,7 @@ with tab_single:
 
         st.write("---")
         st.subheader("Implied Stock Price")
-        
-        col_val1, col_val2 = st.columns(2)
-        with col_val1:
-            st.write(f"**Current Market Price:** ${current_price:,.2f}")
-        with col_val2:
-            analyst_str = f"${st.session_state.analyst_target_tab1:,.2f}" if isinstance(st.session_state.analyst_target_tab1, (int, float)) and pd.notna(st.session_state.analyst_target_tab1) else "N/A"
-            st.write(f"**Analyst Mean Target (1Y):** {analyst_str}")
+        st.write(f"**Current Market Price:** ${current_price:,.2f}")
             
         t_pe = st.number_input("Target P/E Ratio:", value=25.0, step=1.0, key="pe_tab1")
         
@@ -382,7 +417,7 @@ with tab_single:
         l_prc = base.mark_line(color="#e8a329", point=alt.OverlayMarkDef(color="#e8a329", size=60)).encode(y=alt.Y(f'Target Price (PE {t_pe:g}):Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329', grid=False, minExtent=40)), tooltip=['Date:T', f'Target Price (PE {t_pe:g})'])
         st.altair_chart(alt.layer(l_eps, l_prc).resolve_scale(y='independent').properties(height=350).interactive(), use_container_width=True)
 
-# ================= TAB 2: S&P 500 SCREENER =================
+# ================= TAB 2: S&P 500 SCREENER (ANNUAL) =================
 with tab_screener:
     st.subheader("S&P 500 Multi-Model Ranking Dashboard")
     
@@ -396,13 +431,12 @@ with tab_screener:
         
     st.markdown(f"**Data Last Loaded:** `{last_updated}`")
     
-    # --- TARGETED CACHE INJECTION CONTROLS ---
     st.write("### ⚡ Data Refresh Controls")
     c1, c2, c3 = st.columns([2, 1, 1])
 
     with c1:
         st.write("Update the entire S&P 500 matrix (takes ~1 minute).")
-        if st.button("🔄 Force Refresh All (Full API Scan)", use_container_width=True):
+        if st.button("🔄 Force Refresh All (Annual API Scan)", use_container_width=True):
             with st.spinner("Fetching S&P 500 Roster & Executing Fast Scan..."):
                 try:
                     wiki_headers = {"User-Agent": "Mozilla/5.0"}
@@ -428,6 +462,10 @@ with tab_screener:
 
                 status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
                 raw_df = pd.DataFrame(screened_results)
+                
+                if 'Analyst Target' in raw_df.columns:
+                    raw_df = raw_df.drop(columns=['Analyst Target'])
+                    
                 raw_df.to_csv(CACHE_FILE, index=False)
                 st.session_state.raw_screener_df = raw_df
                 st.rerun()
@@ -445,7 +483,7 @@ with tab_screener:
                         res = process_single_screener_stock(refresh_tick)
                         if res:
                             df_cache = st.session_state.raw_screener_df
-                            if 'Analyst Target' not in df_cache.columns: df_cache['Analyst Target'] = np.nan
+                            if 'Analyst Target' in res: del res['Analyst Target']
 
                             if refresh_tick in df_cache['Ticker'].values:
                                 idx = df_cache.index[df_cache['Ticker'] == refresh_tick][0]
@@ -454,11 +492,14 @@ with tab_screener:
                             else:
                                 df_cache = pd.concat([df_cache, pd.DataFrame([res])], ignore_index=True)
 
+                            # Clean old caches just in case
+                            if 'Analyst Target' in df_cache.columns: df_cache = df_cache.drop(columns=['Analyst Target'])
+
                             df_cache.to_csv(CACHE_FILE, index=False)
                             st.session_state.raw_screener_df = df_cache
                             st.rerun()
                         else:
-                            st.error(f"Could not calculate projections for {refresh_tick}.")
+                            st.error(f"Could not calculate projections for {refresh_tick}. Requires 3+ years of public data.")
                 else:
                     st.error("Cache is empty. Run a full scan first to build the database.")
             else:
@@ -466,7 +507,9 @@ with tab_screener:
 
     if 'raw_screener_df' in st.session_state:
         df_base = st.session_state.raw_screener_df.copy()
-        if 'Analyst Target' not in df_base.columns: df_base['Analyst Target'] = np.nan
+        
+        if 'Analyst Target' in df_base.columns:
+            df_base = df_base.drop(columns=['Analyst Target'])
         
         st.write("---")
         st.subheader("🎛️ Filter Opportunities")
@@ -487,12 +530,11 @@ with tab_screener:
 
         filtered_df = df_base[(df_base['Avg Tracking Error (RMSE)'] <= max_rmse) & (df_base['5-Yr CAGR'] >= min_cagr)].sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
         
-        display_cols = ["Ticker", "Current Price", "Analyst Target", "Year 5 Target", "5-Yr CAGR", "Avg Tracking Error (RMSE)"]
+        display_cols = ["Ticker", "Current Price", "Year 5 Target", "5-Yr CAGR", "Avg Tracking Error (RMSE)"]
         
         st.write(f"Showing **{len(filtered_df)}** matching profiles.")
         st.dataframe(filtered_df[display_cols].style.format({
             "Current Price": "${:,.2f}", 
-            "Analyst Target": lambda x: f"${x:,.2f}" if pd.notna(x) else "N/A",
             "Year 5 Target": "${:,.2f}", 
             "5-Yr CAGR": "{:+.1f}%", 
             "Avg Tracking Error (RMSE)": "±${:,.0f}"
