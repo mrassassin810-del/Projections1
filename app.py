@@ -3,6 +3,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 import altair as alt
@@ -32,13 +33,18 @@ if not st.session_state.authenticated:
     st.title("🔒 System Locked")
     pwd = st.text_input("Enter Access Password:", type="password")
     if st.button("Unlock"):
-        # Uses your Streamlit secret if set, otherwise defaults to 'admin123'
         if pwd == st.secrets.get("APP_PASSWORD", "admin123"):
             st.session_state.authenticated = True
             st.rerun()
         else:
             st.error("Incorrect Password")
     st.stop() 
+
+# --- SECRETS MANAGEMENT ---
+try:
+    api_key = st.secrets["AV_API_KEY"]
+except:
+    api_key = None
 
 # --- GLOBAL CONFIG VARIABLES ---
 drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Taxes', 'Shares Outstanding']
@@ -189,49 +195,80 @@ with tab_single:
 
     if analyze_btn:
         with st.spinner(f"Mining data for {ticker_input}..."):
-            error_found = False
+            error_found, use_yf = False, True
             stock = yf.Ticker(ticker_input)
             
-            try:
-                # Deep Mining Backdoor
-                df = stock.quarterly_income_stmt.T
-                if len(df) < 8:
-                    df_alt = stock.quarterly_financials.T
-                    if len(df_alt) > len(df): df = df_alt
-                if len(df) < 8:
-                    try:
-                        df_get = stock.get_income_stmt(freq="quarterly").T
-                        if len(df_get) > len(df): df = df_get
-                    except: pass
-                
-                if df.empty or 'Total Revenue' not in df.columns:
-                    st.error(f"No financial data found for {ticker_input}.")
-                    error_found = True
-                else:
-                    df.index = pd.to_datetime(df.index)
-                    df = df.sort_index()
-                    df_raw = df / 1000
-                    rev = df_raw['Total Revenue']
-                    gp = df_raw['Gross Profit'] if 'Gross Profit' in df_raw.columns else rev
-                    op_inc = df_raw['Operating Income'] if 'Operating Income' in df_raw.columns else gp
-                    ni = df_raw['Net Income'] if 'Net Income' in df_raw.columns else op_inc
-                    
-                    if 'Diluted Average Shares' in df_raw.columns: shares = df_raw['Diluted Average Shares']
-                    elif 'Basic Average Shares' in df_raw.columns: shares = df_raw['Basic Average Shares']
-                    else: shares = pd.Series(1, index=df_raw.index)
+            # --- ALPHA VANTAGE SECRETS PULL ---
+            if api_key:
+                try:
+                    r = requests.get(f'https://www.alphavantage.co/query?function=INCOME_STATEMENT&symbol={ticker_input}&apikey={api_key}').json()
+                    if 'quarterlyReports' in r:
+                        use_yf = False
+                        df_av = pd.DataFrame(r['quarterlyReports'])
+                        df_av['fiscalDateEnding'] = pd.to_datetime(df_av['fiscalDateEnding'])
+                        df_av = df_av.set_index('fiscalDateEnding').sort_index()
 
-                    st.session_state.norm_df = pd.DataFrame({
-                        'Total Revenue': rev, 'Cost Of Revenue': rev - gp, 'Gross Profit': gp, 'Operating Expense': gp - op_inc,
-                        'Operating Income': op_inc, 'Non-Op & Taxes': ni - op_inc, 'Net Income': ni, 'Shares Outstanding': shares, 'EPS': ni / shares
-                    }).dropna()
+                        for col in ['totalRevenue', 'costOfRevenue', 'grossProfit', 'operatingIncome', 'netIncome']:
+                            df_av[col] = pd.to_numeric(df_av[col], errors='coerce').fillna(0) / 1000
+
+                        rev, cogs, gp, op_inc, ni = df_av['totalRevenue'], df_av['costOfRevenue'], df_av['grossProfit'], df_av['operatingIncome'], df_av['netIncome']
+                        shares = pd.Series(stock.info.get('sharesOutstanding', 100000) / 1000, index=df_av.index)
+                        
+                        st.session_state.norm_df = pd.DataFrame({
+                            'Total Revenue': rev, 'Cost Of Revenue': cogs, 'Gross Profit': gp, 'Operating Expense': gp - op_inc,
+                            'Operating Income': op_inc, 'Non-Op & Taxes': ni - op_inc, 'Net Income': ni, 'Shares Outstanding': shares, 'EPS': ni / shares
+                        }).dropna()
+                        
+                        hist_1d = stock.history(period="1d")
+                        st.session_state.current_price = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
+                        st.session_state.ticker_analyzed = ticker_input
+                        st.session_state.actual_lookback = lookback_input
+                        st.session_state.data_source = "Alpha Vantage (Deep History)"
+                    else: st.warning("Alpha Vantage limit reached. Falling back to Yahoo Finance...")
+                except: st.warning(f"Alpha Vantage Error. Falling back to Yahoo Finance...")
+
+            # --- YFINANCE FALLBACK ---
+            if use_yf:
+                try:
+                    df = stock.quarterly_income_stmt.T
+                    if len(df) < 8:
+                        df_alt = stock.quarterly_financials.T
+                        if len(df_alt) > len(df): df = df_alt
+                    if len(df) < 8:
+                        try:
+                            df_get = stock.get_income_stmt(freq="quarterly").T
+                            if len(df_get) > len(df): df = df_get
+                        except: pass
                     
-                    hist_1d = stock.history(period="1d")
-                    st.session_state.current_price = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
-                    st.session_state.ticker_analyzed = ticker_input
-                    st.session_state.actual_lookback = lookback_input
-            except Exception as e:
-                st.error(f"Error processing data: {e}")
-                error_found = True
+                    if df.empty or 'Total Revenue' not in df.columns:
+                        st.error(f"No financial data found for {ticker_input}.")
+                        error_found = True
+                    else:
+                        df.index = pd.to_datetime(df.index)
+                        df = df.sort_index()
+                        df_raw = df / 1000
+                        rev = df_raw['Total Revenue']
+                        gp = df_raw['Gross Profit'] if 'Gross Profit' in df_raw.columns else rev
+                        op_inc = df_raw['Operating Income'] if 'Operating Income' in df_raw.columns else gp
+                        ni = df_raw['Net Income'] if 'Net Income' in df_raw.columns else op_inc
+                        
+                        if 'Diluted Average Shares' in df_raw.columns: shares = df_raw['Diluted Average Shares']
+                        elif 'Basic Average Shares' in df_raw.columns: shares = df_raw['Basic Average Shares']
+                        else: shares = pd.Series(1, index=df_raw.index)
+
+                        st.session_state.norm_df = pd.DataFrame({
+                            'Total Revenue': rev, 'Cost Of Revenue': rev - gp, 'Gross Profit': gp, 'Operating Expense': gp - op_inc,
+                            'Operating Income': op_inc, 'Non-Op & Taxes': ni - op_inc, 'Net Income': ni, 'Shares Outstanding': shares, 'EPS': ni / shares
+                        }).dropna()
+                        
+                        hist_1d = stock.history(period="1d")
+                        st.session_state.current_price = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
+                        st.session_state.ticker_analyzed = ticker_input
+                        st.session_state.actual_lookback = lookback_input
+                        st.session_state.data_source = "Yahoo Finance (Standard)"
+                except Exception as e:
+                    st.error(f"Error processing data: {e}")
+                    error_found = True
             
             if error_found: st.stop()
 
@@ -241,7 +278,7 @@ with tab_single:
         df_reg = norm_df.tail(len(norm_df) if st.session_state.actual_lookback == 0 else st.session_state.actual_lookback)
         
         depth_color = "green" if len(df_reg) >= 8 else "red"
-        st.markdown(f"**Data Depth Indicator:** :{depth_color}[{len(df_reg)} Quarters Loaded] via Yahoo Finance *(Note: ARIMA/Holt-Winters require 6-8 minimum)*")
+        st.markdown(f"**Data Depth Indicator:** :{depth_color}[{len(df_reg)} Quarters Loaded] via {st.session_state.data_source} *(Note: ARIMA/Holt-Winters require 6-8 minimum)*")
         
         x_historical, x_future = np.arange(len(df_reg)).reshape(-1, 1), np.arange(len(df_reg), len(df_reg) + 20).reshape(-1, 1) 
         
@@ -302,8 +339,7 @@ with tab_single:
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
             
-        # FIX: Directly render the markdown without the nested st.markdown function
-        st.markdown(md, unsafe_allow_html=True)
+        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
