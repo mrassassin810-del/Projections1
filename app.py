@@ -355,7 +355,7 @@ with tab_single:
         proj_labels = [(norm_df.index[-1] + pd.DateOffset(months=12 * j)).strftime("LTM %b '%yE") for j in range(1, 6)]
         
         st.subheader(f"Historical & 5-Year Projections ({ticker_input})")
-        md = f"| Metric | {' | '.join(hist_labels + proj_labels)} |\n|---{'|---'*len(hist_labels + proj_labels)}|\n"
+        md = f"\n\n| Metric | {' | '.join(hist_labels + proj_labels)} |\n|---{'|---'*len(hist_labels + proj_labels)}|\n"
         for metric in display_order:
             row = f"| **{metric}** |"
             comb = hist_data[metric] + proj_annual_data[metric]
@@ -456,7 +456,6 @@ with tab_screener:
     if 'raw_screener_df' in st.session_state:
         df_base = st.session_state.raw_screener_df.copy()
         
-        # Patch for older caches to prevent NA crash
         expected_cols = [
             "Market Cap (B)", "Rev Growth (%)", "Current P/E", "Forward P/E", 
             "PEG Ratio", "P/B Ratio", "P/S Ratio", "ROE (%)", "ROA (%)", 
@@ -468,6 +467,9 @@ with tab_screener:
             
         st.write("---")
         
+        # PRE-INITIALIZE ALL TOGGLE VARIABLES TO PREVENT NameError CRASHES
+        t_pe = t_fpe = t_peg = t_ps = t_pb = t_roe = t_pm = t_de = t_rg = t_dy = t_beta = t_mc = t_sh = t_rmse = t_cagr = False
+
         with st.expander("🔬 Deep Toggle Filters", expanded=True):
             col_search, col_pe = st.columns([1, 2])
             search_ticker = col_search.text_input("🔍 Search Ticker:", "").upper()
@@ -475,7 +477,6 @@ with tab_screener:
             
             st.write("##### Enable specific filters to constrain the matrix:")
             
-            # Row 1: Valuations
             f1, f2, f3, f4 = st.columns(4)
             with f1:
                 t_pe = st.toggle("Max Current P/E")
@@ -490,7 +491,6 @@ with tab_screener:
                 t_ps = st.toggle("Max P/S Ratio")
                 if t_ps: max_ps_filter = st.number_input("Value:", value=10.0, key="v_ps")
 
-            # Row 2: Profitability & Health
             f5, f6, f7, f8 = st.columns(4)
             with f5:
                 t_pb = st.toggle("Max P/B Ratio")
@@ -505,7 +505,6 @@ with tab_screener:
                 t_de = st.toggle("Max Debt/Equity")
                 if t_de: max_de_filter = st.number_input("Value:", value=200.0, key="v_de")
 
-            # Row 3: Momentum & Yield
             f9, f10, f11, f12 = st.columns(4)
             with f9:
                 t_rg = st.toggle("Min Rev Growth (%)")
@@ -531,7 +530,6 @@ with tab_screener:
 
         if search_ticker: df_base = df_base[df_base['Ticker'].str.contains(search_ticker, case=False, na=False)]
         
-        # Safe CAGR Calculation for Negative Projections
         df_base['Year 5 Target'] = df_base['Year 5 EPS'] * screener_pe
         df_base['5-Yr CAGR'] = np.where(
             df_base['Year 5 Target'] > 0,
@@ -551,7 +549,6 @@ with tab_screener:
         if t_rg: filtered_df = filtered_df[(filtered_df['Rev Growth (%)'] >= min_rg_filter) & pd.notna(filtered_df['Rev Growth (%)'])]
         if t_dy: filtered_df = filtered_df[(filtered_df['Div Yield (%)'] >= min_dy_filter) & pd.notna(filtered_df['Div Yield (%)'])]
         if t_beta: filtered_df = filtered_df[(filtered_df['Beta'] <= max_beta_filter) & pd.notna(filtered_df['Beta'])]
-        if t_mc: filtered_df = filtered_df[(filtered_df['Market Cap (B)'] >= min_mc_filter) & pd.notna(filtered_df['Market Cap (B)'])]
         if t_sh: filtered_df = filtered_df[(filtered_df['Short % Float'] <= max_sh_filter) & pd.notna(filtered_df['Short % Float'])]
         
         if t_rmse: filtered_df = filtered_df[filtered_df['Avg Tracking Error (RMSE)'] <= max_rmse]
@@ -559,7 +556,6 @@ with tab_screener:
 
         filtered_df = filtered_df.sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
         
-        # Updated to include Forward P/E and Debt/Equity
         display_cols = [
             "Ticker", "Current Price", "Year 5 Target", "5-Yr CAGR", 
             "Current P/E", "Forward P/E", "PEG Ratio", "P/S Ratio", "P/B Ratio",
