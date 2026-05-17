@@ -1,4 +1,5 @@
 import sys
+import os
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -47,6 +48,7 @@ except:
     api_key = None
 
 # --- GLOBAL CONFIG VARIABLES ---
+CACHE_FILE = "sp500_screener_cache.csv"
 drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Taxes', 'Shares Outstanding']
 model_choices = ["Auto", "Linear", "Quadratic", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
 display_order = ['Total Revenue', 'Cost Of Revenue', 'Gross Profit', 'Operating Expense', 'Operating Income', 'Non-Op & Taxes', 'Net Income', 'Shares Outstanding', 'EPS']
@@ -131,12 +133,9 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
     for name, rmse, forecast in valid_models:
         if is_expense and slope > 0 and forecast[-1] < y[-1] and name not in ["Linear", "Quadratic"]: 
             continue
-            
-        # Overfit Filter: Prevent parabolic models from projecting completely impossible multi-trillion market expansions
         if name in ["Quadratic", "Derivative", "ARIMA"] and current_val > 0:
             if forecast[-1] > (current_val * 4) and len(valid_models) > 1:
-                continue # Skip this model for auto-choice, it's overfitting the recent curve
-                
+                continue 
         auto_choice = name
         break
 
@@ -144,7 +143,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, is_expense=False, is_shares=Fal
     return results
 
 # --- BACKGROUND WORKER FOR SCREENER ---
-def process_single_screener_stock(ticker, target_pe):
+def process_single_screener_stock(ticker):
     try:
         stock = yf.Ticker(ticker)
         df = stock.quarterly_income_stmt.T
@@ -186,15 +185,18 @@ def process_single_screener_stock(ticker, target_pe):
         q_proj['Shares Outstanding'] = np.maximum(1, q_proj['Shares Outstanding'])
 
         eps_5y_avg = np.sum(q_proj['Net Income'][16:20]) / np.mean(q_proj['Shares Outstanding'][16:20])
-        target_price_5y = eps_5y_avg * target_pe
-
+        
         hist_1d = stock.history(period="1d")
         current_p = hist_1d['Close'].iloc[-1] if not hist_1d.empty else 0.0
 
-        if current_p <= 0 or target_price_5y <= 0: return None
-        cagr = (target_price_5y / current_p) ** (1/5) - 1
+        if current_p <= 0 or eps_5y_avg <= 0: return None
 
-        return {"Ticker": ticker, "Current Price": round(current_p, 2), "Year 5 Target": round(target_price_5y, 2), "5-Yr CAGR": round(cagr * 100, 2), "Avg Tracking Error (RMSE)": round(total_rmse / len(drivers), 2)}
+        return {
+            "Ticker": ticker, 
+            "Current Price": round(current_p, 2), 
+            "Year 5 EPS": eps_5y_avg, 
+            "Avg Tracking Error (RMSE)": round(total_rmse / len(drivers), 2)
+        }
     except: return None
 
 # --- UI APP TABS ---
@@ -360,7 +362,7 @@ with tab_single:
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
             
-        st.markdown(md, unsafe_allow_html=True)
+        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
@@ -391,51 +393,74 @@ with tab_single:
 # ================= TAB 2: S&P 500 SCREENER =================
 with tab_screener:
     st.subheader("S&P 500 Multi-Model Ranking Dashboard")
-    screener_pe = st.number_input("Universal Target P/E Multiple for Screen:", value=25.0, step=1.0, key="pe_screener")
     
-    start_screen = st.button("🚀 Start S&P 500 Matrix Scan", use_container_width=True)
+    # Auto-load cache if available
+    if os.path.exists(CACHE_FILE) and 'raw_screener_df' not in st.session_state:
+        st.session_state.raw_screener_df = pd.read_csv(CACHE_FILE)
+
+    last_updated = "Never"
+    if os.path.exists(CACHE_FILE):
+        timestamp = os.path.getmtime(CACHE_FILE)
+        last_updated = pd.to_datetime(timestamp, unit='s').strftime('%B %d, %Y at %I:%M %p')
         
-    if start_screen:
-        with st.spinner("Fetching S&P 500 Roster..."):
-            try:
-                wiki_headers = {"User-Agent": "Mozilla/5.0"}
-                sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', storage_options=wiki_headers)[0]
-                tickers = [t.replace('.', '-') for t in sp500_table['Symbol'].tolist()]
-            except Exception as e:
-                st.error(f"Failed to fetch stock index list: {e}")
-                st.stop()
+    st.markdown(f"**Data Last Loaded:** `{last_updated}`")
+    
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        if st.button("🔄 Force Refresh (Full API Scan)", use_container_width=True):
+            with st.spinner("Fetching S&P 500 Roster & Executing Deep Scan..."):
+                try:
+                    wiki_headers = {"User-Agent": "Mozilla/5.0"}
+                    sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', storage_options=wiki_headers)[0]
+                    tickers = [t.replace('.', '-') for t in sp500_table['Symbol'].tolist()]
+                except Exception as e:
+                    st.error(f"Failed to fetch stock index list: {e}")
+                    st.stop()
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        screened_results, completed, total_stocks = [], 0, len(tickers)
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                screened_results, completed, total_stocks = [], 0, len(tickers)
 
-        with ThreadPoolExecutor(max_workers=15) as executor:
-            future_to_ticker = {executor.submit(process_single_screener_stock, t, screener_pe): t for t in tickers}
-            for future in as_completed(future_to_ticker):
-                completed += 1
-                res = future.result()
-                if res: screened_results.append(res)
-                if completed % 15 == 0 or completed == total_stocks:
-                    progress_bar.progress(completed / total_stocks)
-                    status_text.write(f"Scanned {completed}/{total_stocks}...")
+                with ThreadPoolExecutor(max_workers=15) as executor:
+                    future_to_ticker = {executor.submit(process_single_screener_stock, t): t for t in tickers}
+                    for future in as_completed(future_to_ticker):
+                        completed += 1
+                        res = future.result()
+                        if res: screened_results.append(res)
+                        if completed % 15 == 0 or completed == total_stocks:
+                            progress_bar.progress(completed / total_stocks)
+                            status_text.write(f"Scanned {completed}/{total_stocks}...")
 
-        status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
-        st.session_state.screener_df = pd.DataFrame(screened_results)
+                status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
+                raw_df = pd.DataFrame(screened_results)
+                raw_df.to_csv(CACHE_FILE, index=False)
+                st.session_state.raw_screener_df = raw_df
+                st.rerun()
 
-    if 'screener_df' in st.session_state:
-        df_display = st.session_state.screener_df.copy()
+    if 'raw_screener_df' in st.session_state:
+        df_base = st.session_state.raw_screener_df.copy()
+        
         st.write("---")
         st.subheader("🎛️ Filter Opportunities")
         
+        screener_pe = st.number_input("Universal Target P/E Multiple for Screen:", value=25.0, step=1.0, key="pe_screener")
+        
+        # Calculate Target Price and CAGR dynamically from cached Year 5 EPS
+        df_base['Year 5 Target'] = df_base['Year 5 EPS'] * screener_pe
+        df_base['5-Yr CAGR'] = ((df_base['Year 5 Target'] / df_base['Current Price']) ** (1/5) - 1) * 100
+        
         max_rmse = st.slider(
             "Forecast Confidence Filter (Max Historical Tracking Error):", 
-            min_value=float(df_display['Avg Tracking Error (RMSE)'].min()), 
-            max_value=float(df_display['Avg Tracking Error (RMSE)'].max()), 
-            value=float(df_display['Avg Tracking Error (RMSE)'].max() * 0.4),
-            help="Acts as a confidence interval. Lowering this strictness filters out unpredictable stocks, leaving only those that historically track their regression curves tightly."
+            min_value=float(df_base['Avg Tracking Error (RMSE)'].min()), 
+            max_value=float(df_base['Avg Tracking Error (RMSE)'].max()), 
+            value=float(df_base['Avg Tracking Error (RMSE)'].max() * 0.4),
+            help="Acts as a confidence interval. Lowering this strictness filters out unpredictable stocks."
         )
-        min_cagr = st.slider("Minimum Acceptable 5-Yr CAGR (%):", float(df_display['5-Yr CAGR'].min()), float(df_display['5-Yr CAGR'].max()), 12.0)
+        min_cagr = st.slider("Minimum Acceptable 5-Yr CAGR (%):", float(df_base['5-Yr CAGR'].min()), float(df_base['5-Yr CAGR'].max()), 12.0)
 
-        filtered_df = df_display[(df_display['Avg Tracking Error (RMSE)'] <= max_rmse) & (df_display['5-Yr CAGR'] >= min_cagr)].sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
+        filtered_df = df_base[(df_base['Avg Tracking Error (RMSE)'] <= max_rmse) & (df_base['5-Yr CAGR'] >= min_cagr)].sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
+        
+        display_cols = ["Ticker", "Current Price", "Year 5 Target", "5-Yr CAGR", "Avg Tracking Error (RMSE)"]
+        
         st.write(f"Showing **{len(filtered_df)}** matching profiles.")
-        st.dataframe(filtered_df.style.format({"Current Price": "${:,.2f}", "Year 5 Target": "${:,.2f}", "5-Yr CAGR": "{:+.1f}%", "Avg Tracking Error (RMSE)": "±${:,.0f}"}), use_container_width=True)
+        st.dataframe(filtered_df[display_cols].style.format({"Current Price": "${:,.2f}", "Year 5 Target": "${:,.2f}", "5-Yr CAGR": "{:+.1f}%", "Avg Tracking Error (RMSE)": "±${:,.0f}"}), use_container_width=True)
