@@ -22,21 +22,26 @@ warnings.filterwarnings('ignore')
 st.set_page_config(page_title="Forecaster & Screening Engine", layout="wide")
 
 if not HAS_STATSMODELS:
-    st.error("⚠️ **Missing Library:** To use ARIMA and Holt-Winters, please open your terminal and run: `pip install statsmodels`")
+    st.error("⚠️ **Missing Library:** Run: `pip install statsmodels`")
     st.stop()
-
-st.write("Calculates **Linear**, **Derivative**, **Logarithmic**, **Holt-Winters**, and **ARIMA** models. Auto-selects the lowest historical error (RMSE). Values in **Thousands ($000s)**.")
 
 # --- GLOBAL CONFIG VARIABLES ---
 drivers = ['Total Revenue', 'Cost Of Revenue', 'Operating Expense', 'Non-Op & Taxes', 'Shares Outstanding']
 model_choices = ["Auto", "Linear", "Derivative", "Logarithmic", "Holt-Winters", "ARIMA"]
 display_order = ['Total Revenue', 'Cost Of Revenue', 'Gross Profit', 'Operating Expense', 'Operating Income', 'Non-Op & Taxes', 'Net Income', 'Shares Outstanding', 'EPS']
 
-# --- CORE MATH ENGINE (REUSED FOR BOTH TABS) ---
-def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False, is_non_op=False):
+# --- CORE MATH ENGINE WITH REVENUE REALITY GUARDRAILS ---
+def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False, is_non_op=False, is_revenue=False):
     n = len(y)
     results = {}
     floor_val = 1 if is_shares else 0
+
+    # Calculate recent historical growth trajectory to spot hyper-growth anomalies
+    recent_growth_anomaly = False
+    if n >= 4 and y[-4] > 0:
+        historical_yoy_growth = (y[-1] - y[-4]) / y[-4]
+        if historical_yoy_growth > 0.30:  # >30% YoY growth trigger
+            recent_growth_anomaly = True
 
     # 1. Base Linear Model
     lin_model = LinearRegression().fit(x_hist, y)
@@ -66,7 +71,7 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     else:
         results['Derivative'] = {'forecast': None, 'rmse': float('inf')}
 
-    # 3. Logarithmic Model
+    # 3. Logarithmic Model (Growth Decay Engine)
     x_log_hist = np.log(x_hist + 1)
     x_log_fut = np.log(x_fut + 1)
     log_model = LinearRegression().fit(x_log_hist, y)
@@ -87,7 +92,7 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     else:
         results['Holt-Winters'] = {'forecast': None, 'rmse': float('inf')}
 
-    # 5. ARIMA 
+    # 5. ARIMA
     if n >= 6:
         try:
             arima_model = ARIMA(y, order=(1, 1, 1)).fit()
@@ -100,8 +105,9 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     else:
         results['ARIMA'] = {'forecast': None, 'rmse': float('inf')}
 
+    # Reality Clamp: Mitigate compounding model melt
     if is_non_op:
-        upper_bound = max(0, np.max(y)) * 1.5
+        upper_bound = max(0, np.max(y)) * 1.2
         for name in results:
             if results[name]['forecast'] is not None:
                 results[name]['forecast'] = np.minimum(results[name]['forecast'], upper_bound)
@@ -117,13 +123,20 @@ def calculate_metric_models(y, x_hist, x_fut, is_expense=False, is_shares=False,
     for name, rmse, forecast in valid_models:
         if is_expense and slope > 0 and forecast[-1] < y[-1] and name != "Linear":
             continue
+        # Hard Clamp Protection: If high-growth stock, disqualify explosive models for core items
+        if recent_growth_anomaly and (is_revenue or is_expense) and name in ['Derivative', 'ARIMA', 'Linear']:
+            continue
         auto_choice = name
         break
+
+    # Final Fallback to Logarithmic if auto selection remains unsustainably high
+    if recent_growth_anomaly and auto_choice not in ['Logarithmic', 'Holt-Winters'] and results['Logarithmic']['forecast'] is not None:
+        auto_choice = 'Logarithmic'
 
     results['AutoChoice'] = auto_choice
     return results
 
-# --- BACKGROUND WORKER FOR S&P SCREENER ---
+# --- BACKGROUND WORKER FOR SCREENER ---
 def process_single_screener_stock(ticker, target_pe):
     try:
         stock = yf.Ticker(ticker)
@@ -161,7 +174,7 @@ def process_single_screener_stock(ticker, target_pe):
 
         for metric in drivers:
             y = norm_df[metric].values
-            res = calculate_metric_models(y, x_hist, x_fut, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes')
+            res = calculate_metric_models(y, x_hist, x_fut, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes', metric == 'Total Revenue')
             winning_model = res['AutoChoice']
             total_rmse += res[winning_model]['rmse']
             q_forecast = res[winning_model]['forecast']
@@ -196,15 +209,16 @@ with tab_single:
         for m in drivers:
             st.session_state[f"ov_{m}"] = "Auto"
 
+    # Mobile-Responsive UI layout blocks
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1: ticker_input = st.text_input("Enter Ticker:", "PLTR", key="single_tick").upper()
     with col2: lookback_input = st.number_input("Quarters back (0 = All):", min_value=0, max_value=40, value=0, step=1, key="single_lb")
     with col3:
         st.write(""); st.write("")
-        analyze_btn = st.button("Fetch & Analyze", key="single_btn")
+        analyze_btn = st.button("Fetch & Analyze", key="single_btn", use_container_width=True)
 
     if analyze_btn:
-        with st.spinner(f"Fetching data for {ticker_input}..."):
+        with st.spinner(f"Analyzing {ticker_input}..."):
             error_found = False
             try:
                 stock = yf.Ticker(ticker_input)
@@ -212,7 +226,7 @@ with tab_single:
                 if df.empty: df = stock.quarterly_financials.T
                 
                 if df.empty:
-                    st.error(f"No financial data found for {ticker_input} on Yahoo Finance.")
+                    st.error(f"No financial data found for {ticker_input}.")
                     error_found = True
                 else:
                     df.index = pd.to_datetime(df.index)
@@ -258,14 +272,13 @@ with tab_single:
         
         metric_results = {}
         for metric in drivers:
-            metric_results[metric] = calculate_metric_models(df_reg[metric].values, x_historical, x_future, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes')
+            metric_results[metric] = calculate_metric_models(df_reg[metric].values, x_historical, x_future, metric in ['Cost Of Revenue', 'Operating Expense'], metric == 'Shares Outstanding', metric == 'Non-Op & Taxes', metric == 'Total Revenue')
 
         with st.expander("⚙️ Advanced: Override Projection Models"):
             st.button("🔄 Reset all to Auto", on_click=reset_overrides, key="reset_tab1")
-            cols = st.columns(5)
-            for i, metric in enumerate(drivers):
-                with cols[i]:
-                    st.selectbox(metric, options=model_choices, format_func=lambda o, r=metric_results[metric]: f"Auto ({r['AutoChoice']})" if o == "Auto" else (f"{o} (RMSE: ±${int(r[o]['rmse']):,})" if r[o]['rmse'] != float('inf') else f"{o} (N/A)"), key=f"ov_{metric}")
+            for metric in drivers:
+                res = metric_results[metric]
+                st.selectbox(metric, options=model_choices, format_func=lambda o, r=res: f"Auto ({r['AutoChoice']})" if o == "Auto" else (f"{o} (RMSE: ±${int(r[o]['rmse']):,})" if r[o]['rmse'] != float('inf') else f"{o} (N/A)"), key=f"ov_{metric}")
 
         proj_annual_data, proj_quarterly_data, errors, methods = {}, {}, {}, {}
         for metric in drivers:
@@ -287,7 +300,6 @@ with tab_single:
         proj_quarterly_data['Net Income'] = proj_quarterly_data['Operating Income'] + proj_quarterly_data['Non-Op & Taxes']
         proj_quarterly_data['EPS'] = proj_quarterly_data['Net Income'] / proj_quarterly_data['Shares Outstanding']
 
-        # Historical lists
         hist_labels, hist_data = [], {m: [] for m in display_order}
         num_q = len(norm_df)
         ltm_c = min(3, num_q // 4) or 1
@@ -314,7 +326,9 @@ with tab_single:
                     color = "#1d9e75" if (growth > 0 and metric in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) or (growth < 0 and metric not in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) else "#a32d2d"
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
-        st.markdown(md, unsafe_allow_html=True)
+            
+        # Responsive CSS layout container to allow scrolling data tables on a smartphone screen
+        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
@@ -328,7 +342,6 @@ with tab_single:
         val_md += f" <span style='color:{'#1d9e75' if cagr > 0 else '#a32d2d'}; font-weight:600;'>{cagr:+.1%}</span> |"
         st.markdown(val_md, unsafe_allow_html=True)
 
-        # Chart Render Engine
         st.subheader("Visual Forecasts")
         combined_q_df = pd.concat([norm_df, pd.DataFrame(proj_quarterly_data, index=[norm_df.index[-1] + pd.DateOffset(months=3 * j) for j in range(1, 21)])])
         ttm_eps = (combined_q_df['Net Income'].rolling(window=4, min_periods=1).sum() * (4 / combined_q_df['Net Income'].rolling(window=4, min_periods=1).count())) / combined_q_df['Shares Outstanding'].rolling(window=4, min_periods=1).mean()
@@ -341,87 +354,52 @@ with tab_single:
         base = alt.Chart(c_df_reset).encode(x=alt.X('Date:T', title=None, axis=alt.Axis(grid=True)))
         l_eps = base.mark_line(color="#1d9e75", point=alt.OverlayMarkDef(color="#1d9e75", size=60)).encode(y=alt.Y('Quarterly EPS:Q', title='Quarterly EPS ($)', axis=alt.Axis(titleColor='#1d9e75', grid=True, minExtent=40)), tooltip=['Date:T', 'Quarterly EPS'])
         l_prc = base.mark_line(color="#e8a329", point=alt.OverlayMarkDef(color="#e8a329", size=60)).encode(y=alt.Y(f'Target Price (PE {t_pe:g}):Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329', grid=False, minExtent=40)), tooltip=['Date:T', f'Target Price (PE {t_pe:g})'])
-        st.altair_chart(alt.layer(l_eps, l_prc).resolve_scale(y='independent').properties(height=400).interactive(), use_container_width=True)
+        st.altair_chart(alt.layer(l_eps, l_prc).resolve_scale(y='independent').properties(height=350).interactive(), use_container_width=True)
 
 # ================= TAB 2: S&P 500 SCREENER =================
 with tab_screener:
     st.subheader("S&P 500 Multi-Model Ranking Dashboard")
-    st.write("Scans the S&P 500, applies optimal tracking regressions per stock, and ranks them by 5-Year CAGR target potential.")
-
     screener_pe = st.number_input("Universal Target P/E Multiple for Screen:", value=25.0, step=1.0, key="pe_screener")
     
-    col_btn, col_status = st.columns([1, 3])
-    with col_btn:
-        start_screen = st.button("🚀 Start S&P 500 Matrix Scan")
+    start_screen = st.button("🚀 Start S&P 500 Matrix Scan", use_container_width=True)
         
     if start_screen:
-        with st.spinner("Fetching live S&P 500 Roster..."):
+        with st.spinner("Fetching S&P 500 Roster..."):
             try:
-                # Mask request options to prevent Wikipedia from triggering a 403 response
-                wiki_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"}
+                wiki_headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
                 sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', storage_options=wiki_headers)[0]
-                tickers = sp500_table['Symbol'].tolist()
-                tickers = [t.replace('.', '-') for t in tickers]
+                tickers = [t.replace('.', '-') for t in sp500_table['Symbol'].tolist()]
             except Exception as e:
                 st.error(f"Failed to fetch stock index list: {e}")
                 st.stop()
 
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
         screened_results = []
         completed = 0
         total_stocks = len(tickers)
 
         with ThreadPoolExecutor(max_workers=15) as executor:
             future_to_ticker = {executor.submit(process_single_screener_stock, t, screener_pe): t for t in tickers}
-            
             for future in as_completed(future_to_ticker):
                 completed += 1
                 res = future.result()
-                if res:
-                    screened_results.append(res)
-                
-                if completed % 10 == 0 or completed == total_stocks:
+                if res: screened_results.append(res)
+                if completed % 15 == 0 or completed == total_stocks:
                     progress_bar.progress(completed / total_stocks)
-                    status_text.write(f"Processed {completed}/{total_stocks} companies...")
+                    status_text.write(f"Scanned {completed}/{total_stocks}...")
 
-        status_text.success(f"Matrix complete! Successfully built mathematical curves for {len(screened_results)} companies.")
+        status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
         st.session_state.screener_df = pd.DataFrame(screened_results)
 
     if 'screener_df' in st.session_state:
         df_display = st.session_state.screener_df.copy()
-
         st.write("---")
-        st.subheader("🎛️ Filter & Rank Screened Opportunities")
+        st.subheader("🎛️ Filter Opportunities")
         
-        f_col1, f_col2 = st.columns(2)
-        with f_col1:
-            max_rmse = st.slider("Filter out Low-Confidence Projections (Max Avg Tracking Error Allowed):", 
-                                float(df_display['Avg Tracking Error (RMSE)'].min()), 
-                                float(df_display['Avg Tracking Error (RMSE)'].max()), 
-                                float(df_display['Avg Tracking Error (RMSE)'].max() * 0.5))
-        with f_col2:
-            min_cagr = st.slider("Minimum Acceptable 5-Yr CAGR (%):", 
-                                 float(df_display['5-Yr CAGR'].min()), 
-                                 float(df_display['5-Yr CAGR'].max()), 
-                                 10.0)
+        max_rmse = st.slider("Max Avg Tracking Error Allowed (RMSE):", float(df_display['Avg Tracking Error (RMSE)'].min()), float(df_display['Avg Tracking Error (RMSE)'].max()), float(df_display['Avg Tracking Error (RMSE)'].max() * 0.4))
+        min_cagr = st.slider("Minimum Acceptable 5-Yr CAGR (%):", float(df_display['5-Yr CAGR'].min()), float(df_display['5-Yr CAGR'].max()), 12.0)
 
-        filtered_df = df_display[
-            (df_display['Avg Tracking Error (RMSE)'] <= max_rmse) & 
-            (df_display['5-Yr CAGR'] >= min_cagr)
-        ]
-
-        filtered_df = filtered_df.sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
-        
-        st.write(f"Showing **{len(filtered_df)}** matches out of {len(df_display)} companies scanned, sorted by highest potential.")
-        
-        st.dataframe(
-            filtered_df.style.format({
-                "Current Price": "${:,.2f}",
-                "Year 5 Target": "${:,.2f}",
-                "5-Yr CAGR": "{:+.1f}%",
-                "Avg Tracking Error (RMSE)": "±${:,.0f}"
-            }),
-            use_container_width=True
-        )
+        filtered_df = df_display[(df_display['Avg Tracking Error (RMSE)'] <= max_rmse) & (df_display['5-Yr CAGR'] >= min_cagr)].sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
+        st.write(f"Showing **{len(filtered_df)}** matching profiles.")
+        st.dataframe(filtered_df.style.format({"Current Price": "${:,.2f}", "Year 5 Target": "${:,.2f}", "5-Yr CAGR": "{:+.1f}%", "Avg Tracking Error (RMSE)": "±${:,.0f}"}), use_container_width=True)
