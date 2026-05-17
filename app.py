@@ -62,7 +62,6 @@ def fetch_financial_data(ticker, force_deep_dive=False, force_refresh=False):
     stock = yf.Ticker(ticker)
     df_yf = pd.DataFrame()
     
-    # 1. ALWAYS PULL FREE YAHOO FINANCE DATA (Last 4-5 Quarters)
     try:
         if force_deep_dive:
             df = stock.quarterly_income_stmt.T
@@ -99,11 +98,9 @@ def fetch_financial_data(ticker, force_deep_dive=False, force_refresh=False):
     data_source = "Yahoo Finance (Standard)"
     df_final = df_yf
 
-    # 2. DEEP DIVE LOGIC (STITCHING ALPHA VANTAGE + YAHOO)
     if force_deep_dive:
         cache_path = os.path.join(TICKER_CACHE_DIR, f"{ticker}_deep.csv")
         
-        # A. Pull fresh AV if forced or no vault exists
         if force_refresh or not os.path.exists(cache_path):
             if api_key:
                 try:
@@ -118,18 +115,16 @@ def fetch_financial_data(ticker, force_deep_dive=False, force_refresh=False):
                         shares = pd.Series(stock.info.get('sharesOutstanding', 100000) / 1000, index=df_av.index)
                         df_av_clean = pd.DataFrame({'Total Revenue': rev, 'Cost Of Revenue': cogs, 'Gross Profit': gp, 'Operating Expense': gp - op_inc, 'Operating Income': op_inc, 'Non-Op & Taxes': ni - op_inc, 'Net Income': ni, 'Shares Outstanding': shares, 'EPS': ni / shares}).dropna()
                         
-                        df_av_clean.to_csv(cache_path) # Permanently save to vault
+                        df_av_clean.to_csv(cache_path) 
                         df_final = df_av_clean
                         data_source = "Alpha Vantage (Fresh Pull)"
                 except: pass
         
-        # B. Stitching Logic (Load Vault, append fresh YF data)
         if os.path.exists(cache_path) and data_source != "Alpha Vantage (Fresh Pull)":
             df_vault = pd.read_csv(cache_path, index_col=0, parse_dates=True)
             file_age_days = (time.time() - os.path.getmtime(cache_path)) / (60 * 60 * 24)
             
             if not df_yf.empty:
-                # Splice the timelines: Take AV vault data STRICTLY BEFORE Yahoo's oldest date to prevent duplicates
                 yf_oldest_date = df_yf.index.min()
                 df_vault_filtered = df_vault[df_vault.index < yf_oldest_date]
                 df_final = pd.concat([df_vault_filtered, df_yf]).sort_index()
@@ -152,6 +147,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
     pred_lin_fut = np.maximum(floor_val, lin_model.predict(x_fut))
     rmse_lin = np.sqrt(mean_squared_error(y, lin_model.predict(x_hist)))
     results['Linear'] = {'forecast': pred_lin_fut, 'rmse': rmse_lin}
+    slope = lin_model.coef_[0] # Store historical trend direction
 
     # 2. Quadratic
     if n >= 4:
@@ -231,6 +227,11 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
                 is_valid = False 
             elif metric_name == 'Shares Outstanding' and forecast[-1] < (current_val * 0.5):
                 is_valid = False 
+            
+            # DIRECTIONAL CONSISTENCY: If historically increasing, prevent parabolic drops
+            if metric_name in ['Shares Outstanding', 'Operating Expense', 'Cost Of Revenue']:
+                if slope > 0 and forecast[-1] < (current_val * 0.95):
+                    is_valid = False
                 
         if name in ["Quadratic", "Derivative", "ARIMA"] and current_val > 0:
             if forecast[-1] > (current_val * 3.5):
@@ -323,7 +324,7 @@ with tab_single:
         analyze_btn = st.button("Fetch & Analyze", key="single_btn", use_container_width=True)
 
     if analyze_btn:
-        with st.spinner(f"Executing Data Mine for {ticker_input}..."):
+        with st.spinner(f"Executing Deep Data Mine for {ticker_input}..."):
             norm_df, current_price, analyst_target, data_source = fetch_financial_data(ticker_input, force_deep_dive=True, force_refresh=force_refresh_tab1)
             if norm_df.empty:
                 st.error(f"No financial data found for {ticker_input}.")
@@ -403,7 +404,8 @@ with tab_single:
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
             
-        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{st.markdown(md, unsafe_allow_html=True)}</div>', unsafe_allow_html=True)
+        # DeltaGenerator bug fix
+        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{md}</div>', unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
