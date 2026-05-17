@@ -386,40 +386,81 @@ with tab_screener:
         
     st.markdown(f"**Data Last Loaded:** `{last_updated}`")
     
-    if st.button("🔄 Force Refresh (Lightweight API Scan)", use_container_width=True):
-        with st.spinner("Fetching S&P 500 Roster & Executing Fast Scan..."):
-            try:
-                wiki_headers = {"User-Agent": "Mozilla/5.0"}
-                sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', storage_options=wiki_headers)[0]
-                tickers = [t.replace('.', '-') for t in sp500_table['Symbol'].tolist()]
-            except Exception as e:
-                st.error(f"Failed to fetch stock index list: {e}")
-                st.stop()
+    # --- TARGETED CACHE INJECTION CONTROLS ---
+    st.write("### ⚡ Data Refresh Controls")
+    c1, c2, c3 = st.columns([2, 1, 1])
 
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            screened_results, completed, total_stocks = [], 0, len(tickers)
+    with c1:
+        st.write("Update the entire S&P 500 matrix (takes ~1 minute).")
+        if st.button("🔄 Force Refresh All (Full API Scan)", use_container_width=True):
+            with st.spinner("Fetching S&P 500 Roster & Executing Fast Scan..."):
+                try:
+                    wiki_headers = {"User-Agent": "Mozilla/5.0"}
+                    sp500_table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies', storage_options=wiki_headers)[0]
+                    tickers = [t.replace('.', '-') for t in sp500_table['Symbol'].tolist()]
+                except Exception as e:
+                    st.error(f"Failed to fetch stock index list: {e}")
+                    st.stop()
 
-            with ThreadPoolExecutor(max_workers=15) as executor:
-                future_to_ticker = {executor.submit(process_single_screener_stock, t): t for t in tickers}
-                for future in as_completed(future_to_ticker):
-                    completed += 1
-                    res = future.result()
-                    if res: screened_results.append(res)
-                    if completed % 15 == 0 or completed == total_stocks:
-                        progress_bar.progress(completed / total_stocks)
-                        status_text.write(f"Scanned {completed}/{total_stocks}...")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                screened_results, completed, total_stocks = [], 0, len(tickers)
 
-            status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
-            raw_df = pd.DataFrame(screened_results)
-            raw_df.to_csv(CACHE_FILE, index=False)
-            st.session_state.raw_screener_df = raw_df
-            st.rerun()
+                with ThreadPoolExecutor(max_workers=15) as executor:
+                    future_to_ticker = {executor.submit(process_single_screener_stock, t): t for t in tickers}
+                    for future in as_completed(future_to_ticker):
+                        completed += 1
+                        res = future.result()
+                        if res: screened_results.append(res)
+                        if completed % 15 == 0 or completed == total_stocks:
+                            progress_bar.progress(completed / total_stocks)
+                            status_text.write(f"Scanned {completed}/{total_stocks}...")
+
+                status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
+                raw_df = pd.DataFrame(screened_results)
+                raw_df.to_csv(CACHE_FILE, index=False)
+                st.session_state.raw_screener_df = raw_df
+                st.rerun()
+
+    with c2:
+        st.write("Targeted refresh for a single stock.")
+        refresh_tick = st.text_input("Ticker", placeholder="e.g. NVDA", label_visibility="collapsed").upper().strip()
+
+    with c3:
+        st.write("") 
+        if st.button("Targeted Update", use_container_width=True):
+            if refresh_tick:
+                if 'raw_screener_df' in st.session_state:
+                    with st.spinner(f"Recalculating {refresh_tick}..."):
+                        res = process_single_screener_stock(refresh_tick)
+                        if res:
+                            df_cache = st.session_state.raw_screener_df
+                            
+                            # Backward compatibility patch for old caches
+                            if 'Analyst Target' not in df_cache.columns:
+                                df_cache['Analyst Target'] = np.nan
+
+                            if refresh_tick in df_cache['Ticker'].values:
+                                idx = df_cache.index[df_cache['Ticker'] == refresh_tick][0]
+                                for k, v in res.items():
+                                    df_cache.at[idx, k] = v
+                            else:
+                                df_cache = pd.concat([df_cache, pd.DataFrame([res])], ignore_index=True)
+
+                            df_cache.to_csv(CACHE_FILE, index=False)
+                            st.session_state.raw_screener_df = df_cache
+                            st.rerun()
+                        else:
+                            st.error(f"Could not calculate projections for {refresh_tick}.")
+                else:
+                    st.error("Cache is empty. Run a full scan first to build the database.")
+            else:
+                st.warning("Please enter a ticker symbol.")
 
     if 'raw_screener_df' in st.session_state:
         df_base = st.session_state.raw_screener_df.copy()
         
-        # PATCH: Prevent old caches from crashing the app due to missing Analyst Target column
+        # Fallback for old cache formats
         if 'Analyst Target' not in df_base.columns:
             df_base['Analyst Target'] = np.nan
         
