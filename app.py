@@ -147,7 +147,7 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
     pred_lin_fut = np.maximum(floor_val, lin_model.predict(x_fut))
     rmse_lin = np.sqrt(mean_squared_error(y, lin_model.predict(x_hist)))
     results['Linear'] = {'forecast': pred_lin_fut, 'rmse': rmse_lin}
-    slope = lin_model.coef_[0] # Store historical trend direction
+    slope = lin_model.coef_[0]
 
     # 2. Quadratic
     if n >= 4:
@@ -228,7 +228,6 @@ def calculate_metric_models(y_in, x_hist, x_fut, metric_name, force_conservative
             elif metric_name == 'Shares Outstanding' and forecast[-1] < (current_val * 0.5):
                 is_valid = False 
             
-            # DIRECTIONAL CONSISTENCY: If historically increasing, prevent parabolic drops
             if metric_name in ['Shares Outstanding', 'Operating Expense', 'Cost Of Revenue']:
                 if slope > 0 and forecast[-1] < (current_val * 0.95):
                     is_valid = False
@@ -404,8 +403,7 @@ with tab_single:
                     row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
             md += row + "\n"
             
-        # DeltaGenerator bug fix
-        st.markdown(f'<div style="overflow-x: auto; max-width: 100%;">{md}</div>', unsafe_allow_html=True)
+        st.markdown(md, unsafe_allow_html=True)
 
         st.write("---")
         st.subheader("Implied Stock Price")
