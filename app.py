@@ -253,15 +253,20 @@ def run_projections(norm_df, x_hist, x_fut, overrides=None, force_conservative=F
 # --- BACKGROUND WORKER FOR SCREENER (ANNUAL DATA ONLY) ---
 def process_single_screener_stock(ticker):
     try:
-        norm_df, current_p, _, _ = fetch_financial_data(ticker, force_deep_dive=False)
+        norm_df, _, _, _ = fetch_financial_data(ticker, force_deep_dive=False)
         if norm_df.empty or len(norm_df) < 3: return None
+        
+        stock = yf.Ticker(ticker)
+        hist_5y = stock.history(period="5y")
+        hist_5y.index = pd.to_datetime(hist_5y.index).tz_localize(None)
+        current_p = hist_5y['Close'].iloc[-1] if not hist_5y.empty else 0.0
 
         x_hist, x_fut = np.arange(len(norm_df)).reshape(-1, 1), np.arange(len(norm_df), len(norm_df) + 5).reshape(-1, 1)
 
         proj, total_rmse, _ = run_projections(norm_df, x_hist, x_fut)
         eps_y1 = proj['Net Income'][0] / max(1, proj['Shares Outstanding'][0])
         
-        info = yf.Ticker(ticker).info
+        info = stock.info
         try: f_eps = info.get('forwardEps', np.nan)
         except: f_eps = np.nan
 
@@ -276,6 +281,21 @@ def process_single_screener_stock(ticker):
 
         eps_y5 = proj['Net Income'][-1] / max(1, proj['Shares Outstanding'][-1])
         if current_p <= 0: return None
+        
+        # Calculate Historical 5-Year Average P/E dynamically
+        avg_pe = np.nan
+        if not hist_5y.empty and not norm_df.empty:
+            pe_list = []
+            for date, row in norm_df.iterrows():
+                dt = pd.to_datetime(date).tz_localize(None)
+                price_slice = hist_5y.loc[:dt]
+                if not price_slice.empty:
+                    price = price_slice['Close'].iloc[-1]
+                    eps = row['EPS']
+                    if eps > 0: # Exclude negative earnings years from avg P/E
+                        pe_list.append(price / eps)
+            pe_list = [pe for pe in pe_list if pe < 300] # Exclude extreme anomalies
+            if pe_list: avg_pe = np.mean(pe_list)
 
         return {
             "Ticker": ticker, 
@@ -288,6 +308,7 @@ def process_single_screener_stock(ticker):
             "Rev Growth (%)": (info.get('revenueGrowth', np.nan) * 100) if pd.notna(info.get('revenueGrowth')) else np.nan,
             "Current P/E": info.get('trailingPE', np.nan),
             "Forward P/E": info.get('forwardPE', np.nan),
+            "5-Yr Avg P/E": avg_pe,
             "PEG Ratio": info.get('pegRatio', np.nan),
             "P/B Ratio": info.get('priceToBook', np.nan),
             "P/S Ratio": info.get('priceToSalesTrailing12Months', np.nan),
@@ -502,7 +523,7 @@ with tab_screener:
         
         expected_cols = [
             "Company Name", "Industry",
-            "Market Cap (B)", "Rev Growth (%)", "Current P/E", "Forward P/E", 
+            "Market Cap (B)", "Rev Growth (%)", "Current P/E", "Forward P/E", "5-Yr Avg P/E",
             "PEG Ratio", "P/B Ratio", "P/S Ratio", "ROE (%)", "ROA (%)", 
             "Debt/Equity", "Gross Margin (%)", "Profit Margin (%)", 
             "Div Yield (%)", "Beta", "Short % Float"
@@ -513,7 +534,7 @@ with tab_screener:
             
         st.write("---")
         
-        t_pe = t_fpe = t_peg = t_ps = t_pb = t_roe = t_pm = t_de = t_rg = t_dy = t_beta = t_mc = t_sh = t_rmse = t_cagr = t_wl_filter = False
+        t_pe = t_fpe = t_avg_pe = t_peg = t_ps = t_pb = t_roe = t_pm = t_de = t_rg = t_dy = t_beta = t_mc = t_sh = t_rmse = t_cagr = t_wl_filter = False
 
         with st.expander("🔬 Deep Toggle Filters", expanded=True):
             col_search, col_pe, col_wl_tog = st.columns([1.5, 1.5, 1])
@@ -523,7 +544,7 @@ with tab_screener:
             
             st.write("##### Enable specific filters to constrain the matrix:")
             
-            f1, f2, f3, f4 = st.columns(4)
+            f1, f2, f3, f4, f5 = st.columns(5)
             with f1:
                 t_pe = st.toggle("Current P/E Range")
                 if t_pe: range_pe = st.slider("Current P/E", 0.0, 200.0, (10.0, 50.0), step=0.5, key="v_pe", label_visibility="collapsed")
@@ -531,37 +552,40 @@ with tab_screener:
                 t_fpe = st.toggle("Forward P/E Range")
                 if t_fpe: range_fpe = st.slider("Forward P/E", 0.0, 150.0, (5.0, 35.0), step=0.5, key="v_fpe", label_visibility="collapsed")
             with f3:
+                t_avg_pe = st.toggle("5-Yr Avg P/E Range")
+                if t_avg_pe: range_avg_pe = st.slider("5-Yr Avg P/E", 0.0, 150.0, (5.0, 35.0), step=0.5, key="v_avg_pe", label_visibility="collapsed")
+            with f4:
                 t_peg = st.toggle("PEG Ratio Range")
                 if t_peg: range_peg = st.slider("PEG Ratio", 0.0, 10.0, (0.0, 3.0), step=0.1, key="v_peg", label_visibility="collapsed")
-            with f4:
+            with f5:
                 t_ps = st.toggle("P/S Ratio Range")
                 if t_ps: range_ps = st.slider("P/S Ratio", 0.0, 50.0, (0.0, 10.0), step=0.5, key="v_ps", label_visibility="collapsed")
 
-            f5, f6, f7, f8 = st.columns(4)
-            with f5:
+            f6, f7, f8, f9 = st.columns(4)
+            with f6:
                 t_pb = st.toggle("P/B Ratio Range")
                 if t_pb: range_pb = st.slider("P/B Ratio", 0.0, 50.0, (0.0, 15.0), step=0.5, key="v_pb", label_visibility="collapsed")
-            with f6:
+            with f7:
                 t_roe = st.toggle("ROE (%) Range")
                 if t_roe: range_roe = st.slider("ROE (%)", -100.0, 200.0, (10.0, 200.0), step=1.0, key="v_roe", label_visibility="collapsed")
-            with f7:
+            with f8:
                 t_pm = st.toggle("Profit Margin (%)")
                 if t_pm: range_pm = st.slider("Profit Margin (%)", -100.0, 100.0, (5.0, 100.0), step=1.0, key="v_pm", label_visibility="collapsed")
-            with f8:
+            with f9:
                 t_de = st.toggle("Debt/Equity Range")
                 if t_de: range_de = st.slider("Debt/Equity", 0.0, 500.0, (0.0, 200.0), step=5.0, key="v_de", label_visibility="collapsed")
 
-            f9, f10, f11, f12 = st.columns(4)
-            with f9:
+            f10, f11, f12, f13 = st.columns(4)
+            with f10:
                 t_rg = st.toggle("Rev Growth (%)")
                 if t_rg: range_rg = st.slider("Rev Growth (%)", -50.0, 200.0, (5.0, 200.0), step=1.0, key="v_rg", label_visibility="collapsed")
-            with f10:
+            with f11:
                 t_dy = st.toggle("Div Yield (%)")
                 if t_dy: range_dy = st.slider("Div Yield (%)", 0.0, 20.0, (1.0, 20.0), step=0.5, key="v_dy", label_visibility="collapsed")
-            with f11:
+            with f12:
                 t_beta = st.toggle("Beta Range")
                 if t_beta: range_beta = st.slider("Beta", 0.0, 5.0, (0.0, 1.5), step=0.1, key="v_beta", label_visibility="collapsed")
-            with f12:
+            with f13:
                 t_sh = st.toggle("Short % Float")
                 if t_sh: range_sh = st.slider("Short % Float", 0.0, 50.0, (0.0, 10.0), step=0.5, key="v_sh", label_visibility="collapsed")
 
@@ -589,6 +613,7 @@ with tab_screener:
         
         if t_pe: filtered_df = filtered_df[filtered_df['Current P/E'].between(range_pe[0], range_pe[1]) | filtered_df['Current P/E'].isna()]
         if t_fpe: filtered_df = filtered_df[filtered_df['Forward P/E'].between(range_fpe[0], range_fpe[1]) | filtered_df['Forward P/E'].isna()]
+        if t_avg_pe: filtered_df = filtered_df[filtered_df['5-Yr Avg P/E'].between(range_avg_pe[0], range_avg_pe[1]) | filtered_df['5-Yr Avg P/E'].isna()]
         if t_peg: filtered_df = filtered_df[filtered_df['PEG Ratio'].between(range_peg[0], range_peg[1]) | filtered_df['PEG Ratio'].isna()]
         if t_ps: filtered_df = filtered_df[filtered_df['P/S Ratio'].between(range_ps[0], range_ps[1]) | filtered_df['P/S Ratio'].isna()]
         if t_pb: filtered_df = filtered_df[filtered_df['P/B Ratio'].between(range_pb[0], range_pb[1]) | filtered_df['P/B Ratio'].isna()]
@@ -607,7 +632,7 @@ with tab_screener:
         
         display_cols = [
             "Ticker", "Company Name", "Industry", "Current Price", "Year 5 Target", "5-Yr CAGR", 
-            "Current P/E", "Forward P/E", "PEG Ratio", "P/S Ratio", "P/B Ratio",
+            "Current P/E", "Forward P/E", "5-Yr Avg P/E", "PEG Ratio", "P/S Ratio", "P/B Ratio",
             "ROE (%)", "Debt/Equity", "Profit Margin (%)", "Rev Growth (%)", 
             "Div Yield (%)", "Avg Tracking Error (RMSE)"
         ]
@@ -615,7 +640,7 @@ with tab_screener:
         st.write(f"Showing **{len(filtered_df)}** matching profiles.")
         st.dataframe(filtered_df[display_cols].style.format({
             "Current Price": "${:,.2f}", "Year 5 Target": "${:,.2f}", "5-Yr CAGR": "{:+.1f}%", 
-            "Current P/E": "{:.2f}", "Forward P/E": "{:.2f}", "PEG Ratio": "{:.2f}", 
+            "Current P/E": "{:.2f}", "Forward P/E": "{:.2f}", "5-Yr Avg P/E": "{:.2f}", "PEG Ratio": "{:.2f}", 
             "P/S Ratio": "{:.2f}", "P/B Ratio": "{:.2f}", "ROE (%)": "{:.1f}%", 
             "Debt/Equity": "{:.2f}", "Profit Margin (%)": "{:.1f}%", "Rev Growth (%)": "{:.1f}%", 
             "Div Yield (%)": "{:.2f}%", "Avg Tracking Error (RMSE)": "±${:,.0f}"
