@@ -467,7 +467,6 @@ with tab_screener:
             
         st.write("---")
         
-        # PRE-INITIALIZE ALL TOGGLE VARIABLES TO PREVENT NameError CRASHES
         t_pe = t_fpe = t_peg = t_ps = t_pb = t_roe = t_pm = t_de = t_rg = t_dy = t_beta = t_mc = t_sh = t_rmse = t_cagr = False
 
         with st.expander("🔬 Deep Toggle Filters", expanded=True):
@@ -479,45 +478,45 @@ with tab_screener:
             
             f1, f2, f3, f4 = st.columns(4)
             with f1:
-                t_pe = st.toggle("Max Current P/E")
-                if t_pe: max_pe_filter = st.number_input("Value:", value=50.0, key="v_pe")
+                t_pe = st.toggle("Current P/E Range")
+                if t_pe: range_pe = st.slider("Current P/E", 0.0, 200.0, (10.0, 50.0), step=0.5, key="v_pe", label_visibility="collapsed")
             with f2:
-                t_fpe = st.toggle("Max Forward P/E")
-                if t_fpe: max_fpe_filter = st.number_input("Value:", value=35.0, key="v_fpe")
+                t_fpe = st.toggle("Forward P/E Range")
+                if t_fpe: range_fpe = st.slider("Forward P/E", 0.0, 150.0, (5.0, 35.0), step=0.5, key="v_fpe", label_visibility="collapsed")
             with f3:
-                t_peg = st.toggle("Max PEG Ratio")
-                if t_peg: max_peg_filter = st.number_input("Value:", value=3.0, key="v_peg")
+                t_peg = st.toggle("PEG Ratio Range")
+                if t_peg: range_peg = st.slider("PEG Ratio", 0.0, 10.0, (0.0, 3.0), step=0.1, key="v_peg", label_visibility="collapsed")
             with f4:
-                t_ps = st.toggle("Max P/S Ratio")
-                if t_ps: max_ps_filter = st.number_input("Value:", value=10.0, key="v_ps")
+                t_ps = st.toggle("P/S Ratio Range")
+                if t_ps: range_ps = st.slider("P/S Ratio", 0.0, 50.0, (0.0, 10.0), step=0.5, key="v_ps", label_visibility="collapsed")
 
             f5, f6, f7, f8 = st.columns(4)
             with f5:
-                t_pb = st.toggle("Max P/B Ratio")
-                if t_pb: max_pb_filter = st.number_input("Value:", value=15.0, key="v_pb")
+                t_pb = st.toggle("P/B Ratio Range")
+                if t_pb: range_pb = st.slider("P/B Ratio", 0.0, 50.0, (0.0, 15.0), step=0.5, key="v_pb", label_visibility="collapsed")
             with f6:
-                t_roe = st.toggle("Min ROE (%)")
-                if t_roe: min_roe_filter = st.number_input("Value:", value=10.0, key="v_roe")
+                t_roe = st.toggle("ROE (%) Range")
+                if t_roe: range_roe = st.slider("ROE (%)", -100.0, 200.0, (10.0, 200.0), step=1.0, key="v_roe", label_visibility="collapsed")
             with f7:
-                t_pm = st.toggle("Min Profit Margin (%)")
-                if t_pm: min_pm_filter = st.number_input("Value:", value=5.0, key="v_pm")
+                t_pm = st.toggle("Profit Margin (%)")
+                if t_pm: range_pm = st.slider("Profit Margin (%)", -100.0, 100.0, (5.0, 100.0), step=1.0, key="v_pm", label_visibility="collapsed")
             with f8:
-                t_de = st.toggle("Max Debt/Equity")
-                if t_de: max_de_filter = st.number_input("Value:", value=200.0, key="v_de")
+                t_de = st.toggle("Debt/Equity Range")
+                if t_de: range_de = st.slider("Debt/Equity", 0.0, 500.0, (0.0, 200.0), step=5.0, key="v_de", label_visibility="collapsed")
 
             f9, f10, f11, f12 = st.columns(4)
             with f9:
-                t_rg = st.toggle("Min Rev Growth (%)")
-                if t_rg: min_rg_filter = st.number_input("Value:", value=5.0, key="v_rg")
+                t_rg = st.toggle("Rev Growth (%)")
+                if t_rg: range_rg = st.slider("Rev Growth (%)", -50.0, 200.0, (5.0, 200.0), step=1.0, key="v_rg", label_visibility="collapsed")
             with f10:
-                t_dy = st.toggle("Min Div Yield (%)")
-                if t_dy: min_dy_filter = st.number_input("Value:", value=1.0, key="v_dy")
+                t_dy = st.toggle("Div Yield (%)")
+                if t_dy: range_dy = st.slider("Div Yield (%)", 0.0, 20.0, (1.0, 20.0), step=0.5, key="v_dy", label_visibility="collapsed")
             with f11:
-                t_beta = st.toggle("Max Beta")
-                if t_beta: max_beta_filter = st.number_input("Value:", value=1.5, key="v_beta")
+                t_beta = st.toggle("Beta Range")
+                if t_beta: range_beta = st.slider("Beta", 0.0, 5.0, (0.0, 1.5), step=0.1, key="v_beta", label_visibility="collapsed")
             with f12:
-                t_sh = st.toggle("Max Short %")
-                if t_sh: max_sh_filter = st.number_input("Value:", value=10.0, key="v_sh")
+                t_sh = st.toggle("Short % Float")
+                if t_sh: range_sh = st.slider("Short % Float", 0.0, 50.0, (0.0, 10.0), step=0.5, key="v_sh", label_visibility="collapsed")
 
             st.write("##### Engine Confidence Limits")
             e1, e2 = st.columns(2)
@@ -525,8 +524,8 @@ with tab_screener:
                 t_rmse = st.toggle("Max Tracking Error (RMSE)", value=True)
                 if t_rmse: max_rmse = st.slider("Max Tracking Error (RMSE):", float(df_base['Avg Tracking Error (RMSE)'].min()), float(df_base['Avg Tracking Error (RMSE)'].max()), float(df_base['Avg Tracking Error (RMSE)'].max() * 0.4), label_visibility="collapsed")
             with e2:
-                t_cagr = st.toggle("Min 5-Yr CAGR (%)", value=True)
-                if t_cagr: min_cagr = st.slider("Min Acceptable 5-Yr CAGR (%):", float(df_base['5-Yr CAGR'].min()) if '5-Yr CAGR' in df_base.columns else -50.0, 100.0, 12.0, label_visibility="collapsed")
+                t_cagr = st.toggle("5-Yr CAGR (%) Range", value=True)
+                if t_cagr: range_cagr = st.slider("5-Yr CAGR (%)", float(df_base['5-Yr CAGR'].min()) if '5-Yr CAGR' in df_base.columns else -50.0, 200.0, (12.0, 200.0), step=1.0, label_visibility="collapsed")
 
         if search_ticker: df_base = df_base[df_base['Ticker'].str.contains(search_ticker, case=False, na=False)]
         
@@ -538,21 +537,22 @@ with tab_screener:
         )
         
         filtered_df = df_base.copy()
-        if t_pe: filtered_df = filtered_df[(filtered_df['Current P/E'] <= max_pe_filter) & pd.notna(filtered_df['Current P/E'])]
-        if t_fpe: filtered_df = filtered_df[(filtered_df['Forward P/E'] <= max_fpe_filter) & pd.notna(filtered_df['Forward P/E'])]
-        if t_peg: filtered_df = filtered_df[(filtered_df['PEG Ratio'] <= max_peg_filter) & pd.notna(filtered_df['PEG Ratio'])]
-        if t_ps: filtered_df = filtered_df[(filtered_df['P/S Ratio'] <= max_ps_filter) & pd.notna(filtered_df['P/S Ratio'])]
-        if t_pb: filtered_df = filtered_df[(filtered_df['P/B Ratio'] <= max_pb_filter) & pd.notna(filtered_df['P/B Ratio'])]
-        if t_roe: filtered_df = filtered_df[(filtered_df['ROE (%)'] >= min_roe_filter) & pd.notna(filtered_df['ROE (%)'])]
-        if t_pm: filtered_df = filtered_df[(filtered_df['Profit Margin (%)'] >= min_pm_filter) & pd.notna(filtered_df['Profit Margin (%)'])]
-        if t_de: filtered_df = filtered_df[(filtered_df['Debt/Equity'] <= max_de_filter) & pd.notna(filtered_df['Debt/Equity'])]
-        if t_rg: filtered_df = filtered_df[(filtered_df['Rev Growth (%)'] >= min_rg_filter) & pd.notna(filtered_df['Rev Growth (%)'])]
-        if t_dy: filtered_df = filtered_df[(filtered_df['Div Yield (%)'] >= min_dy_filter) & pd.notna(filtered_df['Div Yield (%)'])]
-        if t_beta: filtered_df = filtered_df[(filtered_df['Beta'] <= max_beta_filter) & pd.notna(filtered_df['Beta'])]
-        if t_sh: filtered_df = filtered_df[(filtered_df['Short % Float'] <= max_sh_filter) & pd.notna(filtered_df['Short % Float'])]
+        
+        if t_pe: filtered_df = filtered_df[filtered_df['Current P/E'].between(range_pe[0], range_pe[1]) | filtered_df['Current P/E'].isna()]
+        if t_fpe: filtered_df = filtered_df[filtered_df['Forward P/E'].between(range_fpe[0], range_fpe[1]) | filtered_df['Forward P/E'].isna()]
+        if t_peg: filtered_df = filtered_df[filtered_df['PEG Ratio'].between(range_peg[0], range_peg[1]) | filtered_df['PEG Ratio'].isna()]
+        if t_ps: filtered_df = filtered_df[filtered_df['P/S Ratio'].between(range_ps[0], range_ps[1]) | filtered_df['P/S Ratio'].isna()]
+        if t_pb: filtered_df = filtered_df[filtered_df['P/B Ratio'].between(range_pb[0], range_pb[1]) | filtered_df['P/B Ratio'].isna()]
+        if t_roe: filtered_df = filtered_df[filtered_df['ROE (%)'].between(range_roe[0], range_roe[1]) | filtered_df['ROE (%)'].isna()]
+        if t_pm: filtered_df = filtered_df[filtered_df['Profit Margin (%)'].between(range_pm[0], range_pm[1]) | filtered_df['Profit Margin (%)'].isna()]
+        if t_de: filtered_df = filtered_df[filtered_df['Debt/Equity'].between(range_de[0], range_de[1]) | filtered_df['Debt/Equity'].isna()]
+        if t_rg: filtered_df = filtered_df[filtered_df['Rev Growth (%)'].between(range_rg[0], range_rg[1]) | filtered_df['Rev Growth (%)'].isna()]
+        if t_dy: filtered_df = filtered_df[filtered_df['Div Yield (%)'].between(range_dy[0], range_dy[1]) | filtered_df['Div Yield (%)'].isna()]
+        if t_beta: filtered_df = filtered_df[filtered_df['Beta'].between(range_beta[0], range_beta[1]) | filtered_df['Beta'].isna()]
+        if t_sh: filtered_df = filtered_df[filtered_df['Short % Float'].between(range_sh[0], range_sh[1]) | filtered_df['Short % Float'].isna()]
         
         if t_rmse: filtered_df = filtered_df[filtered_df['Avg Tracking Error (RMSE)'] <= max_rmse]
-        if t_cagr: filtered_df = filtered_df[filtered_df['5-Yr CAGR'] >= min_cagr]
+        if t_cagr: filtered_df = filtered_df[filtered_df['5-Yr CAGR'].between(range_cagr[0], range_cagr[1])]
 
         filtered_df = filtered_df.sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
         
