@@ -265,8 +265,11 @@ def process_single_screener_stock(ticker):
         eps_y5 = proj['Net Income'][-1] / max(1, proj['Shares Outstanding'][-1])
         if current_p <= 0: return None
 
+        # Build Return Dictionary with deep metrics & Company Profile
         return {
             "Ticker": ticker, 
+            "Company Name": info.get('shortName', info.get('longName', 'N/A')),
+            "Industry": info.get('industry', 'N/A'),
             "Current Price": round(current_p, 2), 
             "Year 5 EPS": eps_y5, 
             "Avg Tracking Error (RMSE)": round(total_rmse / len(drivers), 2),
@@ -457,13 +460,15 @@ with tab_screener:
         df_base = st.session_state.raw_screener_df.copy()
         
         expected_cols = [
+            "Company Name", "Industry",
             "Market Cap (B)", "Rev Growth (%)", "Current P/E", "Forward P/E", 
             "PEG Ratio", "P/B Ratio", "P/S Ratio", "ROE (%)", "ROA (%)", 
             "Debt/Equity", "Gross Margin (%)", "Profit Margin (%)", 
             "Div Yield (%)", "Beta", "Short % Float"
         ]
         for col in expected_cols:
-            if col not in df_base.columns: df_base[col] = np.nan
+            if col not in df_base.columns: 
+                df_base[col] = "N/A" if col in ["Company Name", "Industry"] else np.nan
             
         st.write("---")
         
@@ -557,7 +562,7 @@ with tab_screener:
         filtered_df = filtered_df.sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
         
         display_cols = [
-            "Ticker", "Current Price", "Year 5 Target", "5-Yr CAGR", 
+            "Ticker", "Company Name", "Industry", "Current Price", "Year 5 Target", "5-Yr CAGR", 
             "Current P/E", "Forward P/E", "PEG Ratio", "P/S Ratio", "P/B Ratio",
             "ROE (%)", "Debt/Equity", "Profit Margin (%)", "Rev Growth (%)", 
             "Div Yield (%)", "Avg Tracking Error (RMSE)"
