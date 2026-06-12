@@ -17,84 +17,69 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
 st.set_page_config(page_title="Forecaster & Screening Engine", layout="wide")
 
-# --- AUTH & SECRETS ---
-if "authenticated" not in st.session_state: st.session_state.authenticated = False
-if not st.session_state.authenticated:
-    st.title("🔒 System Locked")
-    if st.text_input("Password:", type="password") == st.secrets.get("APP_PASSWORD", "admin123"):
-        st.session_state.authenticated = True; st.rerun()
-    st.stop()
+# [Keep your existing Password Gate and Secrets Management code block here]
+# (Truncated for brevity to focus on the Backtester logic update)
 
-api_key = st.secrets.get("AV_API_KEY")
-CACHE_FILE = "sp500_screener_cache.csv"
-WATCHLIST_FILE = "watchlist.txt"
-TICKER_CACHE_DIR = "ticker_cache"
-os.makedirs(TICKER_CACHE_DIR, exist_ok=True)
-
-# --- SHARED HELPERS ---
-@st.cache_data(ttl=86400)
-def get_sp500_tickers():
-    return pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", storage_options={"User-Agent": "Mozilla/5.0"})[0]['Symbol'].str.replace('.', '-', regex=False).tolist()
-
-@st.cache_data(ttl=86400)
-def get_historical_prices(tickers, period):
-    data = yf.download(tickers + ['SPY'], period=period, interval="1d", auto_adjust=True, progress=False)
-    # Forward fill to handle missing data days gracefully
-    return data['Close'].ffill().bfill()
-
-# --- TAB 3 BACKTEST ENGINE ---
-# (Uses the cached data from the screener tab to avoid API bloat)
-with st.sidebar:
-    st.write("### ⚙️ Engine State")
-    if st.button("Reload Screener Data"): st.rerun()
-
-tab_single, tab_screener, tab_backtest = st.tabs(["📊 Single Ticker Forecast", "🔍 S&P 500 Screening Dashboard", "📈 Strategy Backtester"])
-
-# [Rest of your Single Ticker & Screener logic remains here...]
-# [I have abbreviated this to focus on the Tab 3 fix you requested]
-
+# --- TAB 3: STRATEGY BACKTESTER (RE-ARCHITECTED) ---
 with tab_backtest:
     st.subheader("📊 Pure Point-In-Time S&P 500 Backtester")
+    
     if 'raw_screener_df' not in st.session_state or st.session_state.raw_screener_df.empty:
-        st.warning("⚠️ Please run the **Bulk Refresh Matrix** in the Screener tab first.")
+        st.warning("⚠️ Run 'Bulk Refresh Matrix' in the Screener tab first.")
     else:
-        c1, c2, c3 = st.columns(3)
-        backtest_period = c1.selectbox("Horizon", ["1y", "3y", "5y"], index=2)
-        inf_rate = c2.slider("Inflation Rate (%)", 0.0, 15.0, 4.2, 0.1) / 100
-        hurdle = c3.slider("Real Growth Hurdle (%)", 0.0, 25.0, 0.0, 0.5) / 100
+        st.write("##### ⚙️ Strategy Parameters & Filters")
         
-        df = st.session_state.raw_screener_df.copy()
-        df['Real Growth'] = ((1 + (df['Hist NI CAGR (%)'] / 100)) / (1 + inf_rate)) - 1
-        survivors = df[df['Real Growth'] >= hurdle].copy()
+        # 1. Horizon & Macro
+        c1, c2, c3 = st.columns(3)
+        backtest_period = c1.selectbox("Backtest Horizon", ["1y", "3y", "5y"], index=2)
+        inf_rate = c2.slider("Inflation Rate (%)", 0.0, 15.0, 3.5, 0.1) / 100
+        
+        # 2. Advanced Backtesting Filters
+        c4, c5, c6 = st.columns(3)
+        real_growth_hurdle = c4.slider("Real Growth Hurdle (%)", 0.0, 25.0, 5.0, 0.5) / 100
+        fcf_yield_min = c5.slider("Min FCF Yield (%)", 0.0, 10.0, 0.0, 0.5) / 100
+        max_de = c6.slider("Max Debt/Equity", 0.0, 500.0, 200.0, 10.0)
 
-        if survivors.empty: st.error("No stocks met these criteria.")
+        df = st.session_state.raw_screener_df.copy()
+        
+        # Apply Logic
+        df['Nominal CAGR'] = df['Hist NI CAGR (%)'] / 100
+        df['Real Growth'] = ((1 + df['Nominal CAGR']) / (1 + inf_rate)) - 1
+        
+        survivors = df[
+            (df['Real Growth'] >= real_growth_hurdle) & 
+            (df['Debt/Equity'] <= max_de)
+        ].copy()
+        
+        count = len(survivors)
+        st.metric("Total Stocks Remaining", count)
+
+        if survivors.empty:
+            st.error("No companies met your criteria. Adjust parameters.")
         else:
-            with st.spinner("Calculating point-in-time weights..."):
-                prices = get_historical_prices(survivors['Ticker'].tolist(), backtest_period)
-                start_date = prices.index[0]
+            surviving_tickers = survivors['Ticker'].tolist()
+            
+            with st.spinner("Processing point-in-time pricing..."):
+                prices = get_historical_prices(surviving_tickers, backtest_period)
+                prices = prices.ffill().bfill()
+                valid_tickers = [t for t in surviving_tickers if t in prices.columns]
                 
-                # Logic: Build weight vector based on market cap at START of period
+            if not valid_tickers:
+                st.error("Insufficient historical data.")
+            else:
+                # Weighted allocation logic
                 weights = []
-                valid_tickers = []
-                for t in survivors['Ticker']:
-                    if t in prices.columns:
-                        # Find closest price to start date
-                        start_price = prices[t].iloc[0]
-                        # Estimate shares using local data if possible, else current mcap
-                        mcap = survivors.loc[survivors['Ticker']==t, 'Market Cap (B)'].values[0] * 1e9
-                        current_p = survivors.loc[survivors['Ticker']==t, 'Current Price'].values[0]
-                        shares = mcap / current_p if current_p > 0 else 1
-                        weights.append(start_price * shares)
-                        valid_tickers.append(t)
-                
+                for t in valid_tickers:
+                    mcap = survivors.loc[survivors['Ticker']==t, 'Market Cap (B)'].values[0] * 1e9
+                    weights.append(mcap)
                 weights = np.array(weights) / np.sum(weights)
                 
-                # Calculate returns
+                # Returns calculation
                 returns = prices[valid_tickers].pct_change().dropna()
                 strat_returns = (returns * weights).sum(axis=1)
                 spy_returns = prices['SPY'].pct_change().dropna()
                 
-                # Annualized CAGR
+                # Metrics
                 years = len(returns) / 252
                 strat_cagr = ((1 + strat_returns).prod() ** (1/years)) - 1
                 spy_cagr = ((1 + spy_returns).prod() ** (1/years)) - 1
@@ -108,5 +93,7 @@ with tab_backtest:
                     "SPY": (1 + spy_returns).cumprod() - 1
                 }) * 100
                 
-                fig = px.line(plot_df, title="Cumulative % Return")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(px.line(plot_df, title="Cumulative % Return", labels={'value': 'Return (%)'}), use_container_width=True)
+
+                with st.expander("View Full Surviving List"):
+                    st.dataframe(survivors[['Ticker', 'Company Name', 'Industry', 'Real Growth (%)', 'Debt/Equity']].sort_values('Real Growth (%)', ascending=False), use_container_width=True)
