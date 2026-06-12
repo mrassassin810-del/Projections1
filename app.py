@@ -93,28 +93,6 @@ def build_standard_df(rev, cogs, gp, op_inc, ni, shares):
         'Shares Outstanding': shares, 'EPS': ni / shares
     }).dropna()
 
-# --- BACKTESTER HELPERS (TAB 3) ---
-def calculate_ni_cagr(ticker):
-    try:
-        stock = yf.Ticker(ticker)
-        financials = stock.financials.T
-        if 'Net Income' not in financials.columns or len(financials) < 2: return ticker, np.nan, np.nan
-        ni_series = financials['Net Income'].dropna()
-        if len(ni_series) < 2 or ni_series.iloc[-1] <= 0: return ticker, np.nan, np.nan
-        latest_ni, oldest_ni, years = ni_series.iloc[0], ni_series.iloc[-1], len(ni_series) - 1
-        if oldest_ni <= 0: return ticker, np.nan, np.nan
-        return ticker, ((latest_ni / oldest_ni) ** (1 / years)) - 1, stock.info.get('marketCap', np.nan)
-    except: return ticker, np.nan, np.nan
-
-@st.cache_data(ttl=86400)
-def build_market_matrix(tickers):
-    results = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
-        for future in as_completed({executor.submit(calculate_ni_cagr, t): t for t in tickers}):
-            t, cagr, mcap = future.result()
-            if pd.notna(cagr) and pd.notna(mcap): results.append({"Ticker": t, "Nominal CAGR": cagr, "Market Cap": mcap})
-    return pd.DataFrame(results)
-
 @st.cache_data(ttl=86400)
 def get_historical_prices(tickers, period):
     data = yf.download(tickers + ['SPY'], period=period, interval="1d", auto_adjust=True, progress=False)
@@ -303,6 +281,7 @@ def process_single_screener_stock(ticker):
         eps_y5 = proj['Net Income'][-1] / max(1, proj['Shares Outstanding'][-1])
         if current_p <= 0: return None
         
+        # Calculate Historical 5-Year Average P/E dynamically
         avg_pe = np.nan
         if not hist_5y.empty and not norm_df.empty:
             pe_list = []
@@ -314,6 +293,14 @@ def process_single_screener_stock(ticker):
                     if eps > 0: pe_list.append(price / eps)
             pe_list = [pe for pe in pe_list if pe < 300]
             if pe_list: avg_pe = np.mean(pe_list)
+            
+        # Calculate Historical Net Income CAGR for the Backtester
+        oldest_ni = norm_df['Net Income'].iloc[0]
+        latest_ni = norm_df['Net Income'].iloc[-1]
+        years = len(norm_df) - 1
+        hist_ni_cagr = np.nan
+        if oldest_ni > 0 and latest_ni > 0 and years > 0:
+            hist_ni_cagr = ((latest_ni / oldest_ni) ** (1 / years)) - 1
 
         return {
             "Ticker": ticker, "Company Name": info.get('shortName', info.get('longName', 'N/A')), "Industry": info.get('industry', 'N/A'),
@@ -327,7 +314,8 @@ def process_single_screener_stock(ticker):
             "Debt/Equity": info.get('debtToEquity', np.nan), "Gross Margin (%)": (info.get('grossMargins', np.nan) * 100) if pd.notna(info.get('grossMargins')) else np.nan,
             "Profit Margin (%)": (info.get('profitMargins', np.nan) * 100) if pd.notna(info.get('profitMargins')) else np.nan,
             "Div Yield (%)": (info.get('dividendYield', np.nan) * 100) if pd.notna(info.get('dividendYield')) else 0.0,
-            "Beta": info.get('beta', np.nan), "Short % Float": (info.get('shortPercentOfFloat', np.nan) * 100) if pd.notna(info.get('shortPercentOfFloat')) else np.nan
+            "Beta": info.get('beta', np.nan), "Short % Float": (info.get('shortPercentOfFloat', np.nan) * 100) if pd.notna(info.get('shortPercentOfFloat')) else np.nan,
+            "Hist NI CAGR (%)": (hist_ni_cagr * 100) if pd.notna(hist_ni_cagr) else np.nan
         }
     except: return None
 
@@ -445,7 +433,7 @@ with tab_screener:
                 except Exception as e: st.error(f"Failed to fetch stock index list: {e}"); st.stop()
 
                 progress_bar, status_text, screened_results, completed = st.progress(0), st.empty(), [], 0
-                with ThreadPoolExecutor(max_workers=15) as executor:
+                with ThreadPoolExecutor(max_workers=10) as executor:
                     for future in as_completed({executor.submit(process_single_screener_stock, t): t for t in tickers}):
                         completed += 1
                         if res := future.result(): screened_results.append(res)
@@ -518,14 +506,14 @@ with tab_screener:
         expected_cols = [
             "Company Name", "Industry", "Market Cap (B)", "Rev Growth (%)", "Current P/E", "Forward P/E", "5-Yr Avg P/E",
             "PEG Ratio", "P/B Ratio", "P/S Ratio", "ROE (%)", "ROA (%)", "Debt/Equity", "Gross Margin (%)", "Profit Margin (%)", 
-            "Div Yield (%)", "Beta", "Short % Float"
+            "Div Yield (%)", "Beta", "Short % Float", "Hist NI CAGR (%)"
         ]
         for col in expected_cols:
-            if col not in df_base.columns: df_base[col] = "N/A" if col in ["Company Name", "Industry"] else np.nan
+            if col not in df_base.columns: 
+                df_base[col] = "N/A" if col in ["Company Name", "Industry"] else np.nan
             
         st.write("---")
         
-        # PRE-INITIALIZE ALL VARIABLES
         t_pe = t_fpe = t_avg_pe = t_peg = t_ps = t_pb = t_roe = t_pm = t_de = t_rg = t_dy = t_beta = t_mc = t_sh = t_rmse = t_cagr = t_wl_filter = False
         range_pe = (0.0, 200.0); range_fpe = (0.0, 150.0); range_avg_pe = (0.0, 150.0); range_peg = (0.0, 10.0)
         range_ps = (0.0, 50.0); range_pb = (0.0, 50.0); range_roe = (-100.0, 200.0); range_pm = (-100.0, 100.0)
@@ -644,82 +632,76 @@ with tab_backtest:
     st.subheader("📊 Macro-Adjusted S&P 500 Backtester")
     st.markdown("Isolates companies outpacing inflation and backtests their historical market-cap weighted performance against the broader index.")
     
-    if "bt_matrix" not in st.session_state: st.session_state.bt_matrix = pd.DataFrame()
-        
-    st.write("##### ⚡ Engine Initialization")
-    if st.button("Download S&P 500 Baseline Data", use_container_width=True):
-        with st.spinner("Downloading 5-year financials for 500 companies..."):
-            tickers = get_sp500_tickers()
-            matrix = build_market_matrix(tickers)
-            if matrix.empty:
-                st.error("Failed to fetch market data from Yahoo Finance. Please try again.")
-            else:
-                st.session_state.bt_matrix = matrix
-                st.success("Data loaded! Adjust parameters below to backtest.")
-
-    if not st.session_state.bt_matrix.empty:
+    if 'raw_screener_df' not in st.session_state or st.session_state.raw_screener_df.empty:
+        st.warning("⚠️ **Engine Uninitialized:** Please go to the **S&P 500 Screening Dashboard** tab and run the **Bulk Refresh Matrix** to build the fundamental database first.")
+    else:
         st.write("##### ⚙️ Strategy Parameters")
         c1, c2, c3 = st.columns(3)
         inf_rate = c1.slider("Inflation Rate (%)", min_value=0.0, max_value=15.0, value=4.2, step=0.1) / 100
         hurdle_rate = c2.slider("Real Growth Hurdle (%)", min_value=0.0, max_value=25.0, value=5.0, step=0.5) / 100
         backtest_period = c3.selectbox("Backtest Horizon", options=["1y", "3y", "5y"], index=2)
         
-        df = st.session_state.bt_matrix.copy()
+        df = st.session_state.raw_screener_df.copy()
         
-        # The Fisher Equation: ((1 + Nominal) / (1 + Inflation)) - 1
-        df['Real Growth'] = ((1 + df['Nominal CAGR']) / (1 + inf_rate)) - 1
-        survivors = df[df['Real Growth'] >= hurdle_rate].copy()
-        
-        if survivors.empty:
-            st.error("No companies met the Real Growth hurdle rate. Lower your parameters.")
+        if 'Hist NI CAGR (%)' not in df.columns or df['Hist NI CAGR (%)'].isna().all():
+            st.error("Your cache is missing the Historical Net Income data. Please go to the Screener tab and click **🔄 Scan Entire S&P 500** to update your database.")
         else:
-            total_mcap = survivors['Market Cap'].sum()
-            survivors['Weight'] = survivors['Market Cap'] / total_mcap
-            survivors = survivors.sort_values(by='Weight', ascending=False)
-
-            st.subheader("Current Portfolio Weights")
-            survivors['Market Cap (B)'] = (survivors['Market Cap'] / 1e9).round(2)
-            survivors['Real Growth (%)'] = (survivors['Real Growth'] * 100).round(2)
+            # The Fisher Equation: ((1 + Nominal) / (1 + Inflation)) - 1
+            df['Nominal CAGR'] = df['Hist NI CAGR (%)'] / 100
+            df['Real Growth'] = ((1 + df['Nominal CAGR']) / (1 + inf_rate)) - 1
             
-            fig_tree = px.treemap(
-                survivors, path=[px.Constant("Surviving Index"), 'Ticker'], values='Weight',
-                color='Real Growth (%)', color_continuous_scale='Greens', hover_data=['Market Cap (B)']
-            )
-            fig_tree.update_layout(margin=dict(t=20, l=10, r=10, b=10), height=400)
-            st.plotly_chart(fig_tree, use_container_width=True)
+            survivors = df[df['Real Growth'] >= hurdle_rate].copy()
+            
+            if survivors.empty:
+                st.error("No companies met the Real Growth hurdle rate. Lower your parameters.")
+            else:
+                total_mcap = survivors['Market Cap (B)'].sum()
+                survivors['Weight'] = survivors['Market Cap (B)'] / total_mcap
+                survivors = survivors.sort_values(by='Weight', ascending=False)
 
-            with st.spinner(f"Downloading {backtest_period} historical price data..."):
-                surviving_tickers = survivors['Ticker'].tolist()
-                prices = get_historical_prices(surviving_tickers, backtest_period)
-                prices = prices.dropna(axis=1, how='all')
-                valid_tickers = [t for t in surviving_tickers if t in prices.columns]
+                st.subheader("Current Portfolio Weights")
+                survivors['Real Growth (%)'] = (survivors['Real Growth'] * 100).round(2)
                 
-                if not valid_tickers:
-                    st.error("Insufficient historical price data for the surviving basket.")
-                else:
-                    backtest_weights = survivors.set_index('Ticker').loc[valid_tickers, 'Weight']
-                    backtest_weights = backtest_weights / backtest_weights.sum()
-
-                    daily_returns = prices.pct_change().dropna()
-                    strat_returns = (daily_returns[valid_tickers] * backtest_weights.values).sum(axis=1)
-                    if 'SPY' in daily_returns.columns:
-                        spy_returns = daily_returns['SPY']
-                        
-                        plot_df = pd.DataFrame({
-                            "Custom Strategy": (1 + strat_returns).cumprod() * 100,
-                            "SPY Benchmark": (1 + spy_returns).cumprod() * 100
-                        })
-
-                        st.subheader(f"Historical Performance ({backtest_period})")
-                        fig_line = px.line(plot_df, labels={'value': 'Cumulative Return ($100 Base)', 'Date': 'Date'}, color_discrete_map={"Custom Strategy": "#00FF00", "SPY Benchmark": "#808080"})
-                        fig_line.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), margin=dict(t=20, l=10, r=10, b=10), xaxis_title="", yaxis_title="Portfolio Value ($)", height=350)
-                        st.plotly_chart(fig_line, use_container_width=True)
-                    else:
-                        st.error("Failed to load SPY benchmark data.")
-
-            with st.expander("View Surviving Constituents"):
-                st.dataframe(
-                    survivors[['Ticker', 'Market Cap (B)', 'Nominal CAGR', 'Real Growth (%)', 'Weight']].style.format({
-                        'Nominal CAGR': '{:.2%}', 'Weight': '{:.2%}'
-                    }), use_container_width=True
+                fig_tree = px.treemap(
+                    survivors, path=[px.Constant("Surviving Index"), 'Ticker'], values='Weight',
+                    color='Real Growth (%)', color_continuous_scale='Greens', hover_data=['Market Cap (B)']
                 )
+                fig_tree.update_layout(margin=dict(t=20, l=10, r=10, b=10), height=400)
+                st.plotly_chart(fig_tree, use_container_width=True)
+
+                with st.spinner(f"Downloading {backtest_period} historical price data for {len(survivors)} tickers..."):
+                    surviving_tickers = survivors['Ticker'].tolist()
+                    prices = get_historical_prices(surviving_tickers, backtest_period)
+                    if not prices.empty:
+                        prices = prices.dropna(axis=1, how='all')
+                    valid_tickers = [t for t in surviving_tickers if t in prices.columns]
+                    
+                    if not valid_tickers:
+                        st.error("Insufficient historical price data for the surviving basket.")
+                    else:
+                        backtest_weights = survivors.set_index('Ticker').loc[valid_tickers, 'Weight']
+                        backtest_weights = backtest_weights / backtest_weights.sum()
+
+                        daily_returns = prices.pct_change().dropna()
+                        strat_returns = (daily_returns[valid_tickers] * backtest_weights.values).sum(axis=1)
+                        if 'SPY' in daily_returns.columns:
+                            spy_returns = daily_returns['SPY']
+                            
+                            plot_df = pd.DataFrame({
+                                "Custom Strategy": (1 + strat_returns).cumprod() * 100,
+                                "SPY Benchmark": (1 + spy_returns).cumprod() * 100
+                            })
+
+                            st.subheader(f"Historical Performance ({backtest_period})")
+                            fig_line = px.line(plot_df, labels={'value': 'Cumulative Return ($100 Base)', 'Date': 'Date'}, color_discrete_map={"Custom Strategy": "#00FF00", "SPY Benchmark": "#808080"})
+                            fig_line.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), margin=dict(t=20, l=10, r=10, b=10), xaxis_title="", yaxis_title="Portfolio Value ($)", height=350)
+                            st.plotly_chart(fig_line, use_container_width=True)
+                        else:
+                            st.error("Failed to load SPY benchmark data.")
+
+                with st.expander("View Surviving Constituents"):
+                    st.dataframe(
+                        survivors[['Ticker', 'Company Name', 'Market Cap (B)', 'Hist NI CAGR (%)', 'Real Growth (%)', 'Weight']].style.format({
+                            'Hist NI CAGR (%)': '{:.2f}%', 'Real Growth (%)': '{:.2f}%', 'Weight': '{:.2%}', 'Market Cap (B)': '${:.2f}B'
+                        }), use_container_width=True
+                    )
