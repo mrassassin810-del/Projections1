@@ -3,7 +3,6 @@ yfinance
 pandas
 numpy
 scikit-learn
-statsmodels
 altair
-lxml
-requests
+statsmodels
+plotly
