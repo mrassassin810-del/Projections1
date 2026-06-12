@@ -637,9 +637,16 @@ with tab_backtest:
     else:
         st.write("##### ⚙️ Strategy Parameters")
         c1, c2, c3 = st.columns(3)
-        inf_rate = c1.slider("Inflation Rate (%)", min_value=0.0, max_value=15.0, value=4.2, step=0.1) / 100
-        hurdle_rate = c2.slider("Real Growth Hurdle (%)", min_value=0.0, max_value=25.0, value=5.0, step=0.5) / 100
-        backtest_period = c3.selectbox("Backtest Horizon", options=["1y", "3y", "5y"], index=2)
+        
+        # Horizon drives the dynamic inflation calculation
+        backtest_period = c1.selectbox("Backtest Horizon", options=["1y", "3y", "5y"], index=2)
+        
+        # Internal map for annualized trailing inflation averages leading into 2026
+        historical_inflation_map = {"1y": 3.1, "3y": 4.5, "5y": 4.2}
+        default_inf = historical_inflation_map.get(backtest_period, 4.2)
+        
+        inf_rate = c2.slider("Auto-Tracked Inflation Rate (%)", min_value=0.0, max_value=15.0, value=default_inf, step=0.1) / 100
+        hurdle_rate = c3.slider("Real Growth Hurdle (%)", min_value=0.0, max_value=25.0, value=5.0, step=0.5) / 100
         
         df = st.session_state.raw_screener_df.copy()
         
@@ -666,7 +673,6 @@ with tab_backtest:
                 if not valid_tickers:
                     st.error("Insufficient historical price data for the surviving basket.")
                 else:
-                    # Pinpoint the day-one date of the historical backtest window
                     start_date = prices.index[0]
                     st.caption(f"Portfolio locked and initialized on True Point-in-Time Matrix: **{start_date.strftime('%B %d, %Y')}**")
                     
@@ -675,18 +681,15 @@ with tab_backtest:
                         hist_price = prices[t].iloc[0]
                         shares_found = None
                         
-                        # Check local deep vault file first for true historical shares
                         cache_path = os.path.join(TICKER_CACHE_DIR, f"{t}_deep.csv")
                         if os.path.exists(cache_path):
                             try:
                                 v_df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
                                 close_idx = v_df.index.get_indexer([start_date], method='nearest')[0]
                                 if close_idx != -1:
-                                    # Convert back out of thousands unit if deep cache used it
                                     shares_found = v_df['Shares Outstanding'].iloc[close_idx] * 1000
                             except: pass
                             
-                        # Intelligent Fallback if no vault file exists or lookup fails
                         if shares_found is None or pd.isna(shares_found):
                             current_mcap = survivors.loc[survivors['Ticker'] == t, 'Market Cap (B)'].values[0] * 1e9
                             current_price = survivors.loc[survivors['Ticker'] == t, 'Current Price'].values[0]
@@ -697,7 +700,6 @@ with tab_backtest:
                         pit_mcap = (hist_price * shares_found) / 1e9 if shares_found else 0.0
                         pit_mcap_list.append(pit_mcap)
                         
-                    # Re-align weights dynamically using the exact point-in-time calculation
                     survivors_pit = survivors[survivors['Ticker'].isin(valid_tickers)].copy()
                     survivors_pit['PIT Market Cap (B)'] = pit_mcap_list
                     total_pit_mcap = survivors_pit['PIT Market Cap (B)'].sum()
@@ -726,14 +728,33 @@ with tab_backtest:
                     
                     if 'SPY' in daily_returns.columns:
                         spy_returns = daily_returns['SPY']
+                        
+                        # --- Exact Fractional Year Calculation for True CAGR ---
+                        exact_years = len(daily_returns) / 252.0
+                        if exact_years <= 0: exact_years = 1.0
+                        
+                        # Cumulative compounding (Base 1)
+                        strat_cumprod = (1 + strat_returns).cumprod()
+                        spy_cumprod = (1 + spy_returns).cumprod()
+                        
+                        # Calculate CAGR
+                        strat_cagr = (strat_cumprod.iloc[-1] ** (1 / exact_years)) - 1
+                        spy_cagr = (spy_cumprod.iloc[-1] ** (1 / exact_years)) - 1
+                        
+                        # Display Metrics
+                        st.subheader(f"Historical Performance ({backtest_period})")
+                        cagr_col1, cagr_col2 = st.columns(2)
+                        cagr_col1.metric("Custom PIT Strategy CAGR", f"{strat_cagr * 100:.2f}%")
+                        cagr_col2.metric("SPY Benchmark CAGR", f"{spy_cagr * 100:.2f}%")
+                        
+                        # Calculate Percentage Returns for the line chart (e.g. +45% instead of $145)
                         plot_df = pd.DataFrame({
-                            "Custom PIT Strategy": (1 + strat_returns).cumprod() * 100,
-                            "SPY Benchmark": (1 + spy_returns).cumprod() * 100
+                            "Custom PIT Strategy": (strat_cumprod - 1) * 100,
+                            "SPY Benchmark": (spy_cumprod - 1) * 100
                         })
 
-                        st.subheader(f"Historical Performance ({backtest_period})")
-                        fig_line = px.line(plot_df, labels={'value': 'Cumulative Return ($100 Base)', 'Date': 'Date'}, color_discrete_map={"Custom PIT Strategy": "#00FF00", "SPY Benchmark": "#808080"})
-                        fig_line.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), margin=dict(t=20, l=10, r=10, b=10), xaxis_title="", yaxis_title="Portfolio Value ($)", height=350)
+                        fig_line = px.line(plot_df, labels={'value': 'Cumulative Return (%)', 'Date': 'Date'}, color_discrete_map={"Custom PIT Strategy": "#00FF00", "SPY Benchmark": "#808080"})
+                        fig_line.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), margin=dict(t=20, l=10, r=10, b=10), xaxis_title="", yaxis_title="Return (%)", height=350)
                         st.plotly_chart(fig_line, use_container_width=True)
                     else:
                         st.error("Failed to load SPY benchmark data.")
