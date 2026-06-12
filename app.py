@@ -257,7 +257,7 @@ def run_projections(norm_df, x_hist, x_fut, overrides=None, force_conservative=F
 def process_single_screener_stock(ticker):
     try:
         norm_df, current_p, _, _, _ = fetch_financial_data(ticker, force_deep_dive=False)
-        if norm_df.empty or len(norm_df) < 3: return None
+        if norm_df.empty or len(norm_df) < 2: return None
         
         stock = yf.Ticker(ticker)
         hist_5y = stock.history(period="5y")
@@ -294,10 +294,21 @@ def process_single_screener_stock(ticker):
             pe_list = [pe for pe in pe_list if pe < 300]
             if pe_list: avg_pe = np.mean(pe_list)
             
-        # Calculate Historical Net Income CAGR for the Backtester
+        # Robust Dynamic Falling Matrix for Historical Net Income CAGR
         oldest_ni = norm_df['Net Income'].iloc[0]
         latest_ni = norm_df['Net Income'].iloc[-1]
         years = len(norm_df) - 1
+        
+        # Fallback to TTM parsing if standard indexing dropped calendar rows
+        if (oldest_ni <= 0 or latest_ni <= 0) and not stock.quarterly_financials.empty:
+            try:
+                q_ni = stock.quarterly_financials.T['Net Income'].dropna()
+                if len(q_ni) >= 5:
+                    latest_ni = q_ni.iloc[:4].sum() / 1000
+                    oldest_ni = q_ni.iloc[-4:].sum() / 1000
+                    years = (q_ni.index[0] - q_ni.index[-1]).days / 365.25
+            except: pass
+
         hist_ni_cagr = np.nan
         if oldest_ni > 0 and latest_ni > 0 and years > 0:
             hist_ni_cagr = ((latest_ni / oldest_ni) ** (1 / years)) - 1
@@ -729,7 +740,7 @@ with tab_backtest:
                     if 'SPY' in daily_returns.columns:
                         spy_returns = daily_returns['SPY']
                         
-                        # --- Exact Fractional Year Calculation for True CAGR ---
+                        # Exact Fractional Year Calculation for True CAGR
                         exact_years = len(daily_returns) / 252.0
                         if exact_years <= 0: exact_years = 1.0
                         
