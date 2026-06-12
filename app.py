@@ -339,4 +339,408 @@ with tab_single:
         if st.button("Fetch & Analyze", key="single_btn", use_container_width=True):
             with st.spinner(f"Executing Deep Data Mine for {ticker_input}..."):
                 norm_df, current_price, analyst_target, data_source, api_warning = fetch_financial_data(ticker_input, force_deep_dive=True, force_refresh=force_refresh_tab1)
-                if norm_df.empty: st.error(f"No financial data found for {
+                if norm_df.empty: st.error(f"No financial data found for {ticker_input}."); st.stop()
+                st.session_state.update({'norm_df': norm_df, 'current_price': current_price, 'analyst_target_tab1': analyst_target, 'ticker_analyzed': ticker_input, 'actual_lookback': lookback_input, 'data_source': data_source, 'api_warning': api_warning})
+
+    if 'norm_df' in st.session_state and st.session_state.ticker_analyzed == ticker_input:
+        if st.session_state.get('api_warning') and force_refresh_tab1: st.warning(f"⚠️ **API Notice:** {st.session_state.api_warning} (Safely fell back to standard Yahoo Finance data).")
+        norm_df, current_price = st.session_state.norm_df, st.session_state.current_price
+        df_reg = norm_df.tail(len(norm_df) if st.session_state.actual_lookback == 0 else st.session_state.actual_lookback)
+        
+        st.markdown(f"**Data Depth Indicator:** :{'green' if len(df_reg) >= 8 else 'red'}[{len(df_reg)} Quarters Loaded] via {st.session_state.data_source} *(Note: ARIMA/Holt-Winters require 6-8 minimum)*")
+        if not api_key: st.info("💡 **Want deeper data?** Add a free Alpha Vantage API key to your Streamlit Secrets.")
+        
+        x_hist, x_fut = np.arange(len(df_reg)).reshape(-1, 1), np.arange(len(df_reg), len(df_reg) + 20).reshape(-1, 1) 
+        proj_quarterly_data, _, metric_results = run_projections(df_reg, x_hist, x_fut, overrides={m: st.session_state[f"ov_{m}"] for m in drivers})
+
+        with st.expander("⚙️ Advanced: Override Projection Models & Explanations"):
+            st.markdown("**Model Selection Guide:** \n* **Linear:** Stable value. \n* **Quadratic:** Hyper-growth/Cyclical. \n* **Logarithmic:** Maturing growth. \n* **Derivative:** Momentum shifts. \n* **Holt-Winters:** Seasonal. \n* **ARIMA:** Macro-driven.")
+            st.write("---")
+            st.button("🔄 Reset all to Auto", on_click=reset_overrides, key="reset_tab1")
+            for metric in drivers: st.selectbox(metric, options=model_choices, format_func=lambda o, r=metric_results[metric]: f"Auto ({r.get('AutoChoice', 'Linear')})" if o == "Auto" else (f"{o} (RMSE: ±${int(r[o]['rmse']):,})" if r.get(o) and r[o].get('rmse', float('inf')) != float('inf') else f"{o} (N/A)"), key=f"ov_{metric}")
+
+        proj_annual_data = {}
+        for metric in display_order:
+            if metric == 'Shares Outstanding': proj_annual_data[metric] = [np.mean(proj_quarterly_data[metric][i*4:(i+1)*4]) for i in range(5)]
+            elif metric != 'EPS': proj_annual_data[metric] = [np.sum(proj_quarterly_data[metric][i*4:(i+1)*4]) for i in range(5)]
+        proj_annual_data['EPS'] = (np.array(proj_annual_data['Net Income']) / np.array(proj_annual_data['Shares Outstanding'])).tolist()
+
+        hist_labels, hist_data = [], {m: [] for m in display_order}
+        for i in range(min(3, len(norm_df) // 4) or 1, 0, -1):
+            chunk = norm_df.iloc[-4:] if i == 1 else norm_df.iloc[-(i*4):-((i-1)*4)]
+            hist_labels.append("LTM (Current)" if i == 1 else f"LTM -{i-1}")
+            for m in display_order: hist_data[m].append(chunk[m].mean() if m == 'Shares Outstanding' else (chunk['Net Income'].sum()/chunk['Shares Outstanding'].mean() if m == 'EPS' else chunk[m].sum()))
+
+        proj_labels = [(norm_df.index[-1] + pd.DateOffset(months=12 * j)).strftime("LTM %b '%yE") for j in range(1, 6)]
+        
+        st.subheader(f"Historical & 5-Year Projections ({ticker_input})")
+        md = f"\n\n| Metric | {' | '.join(hist_labels + proj_labels)} |\n|---{'|---'*len(hist_labels + proj_labels)}|\n"
+        for metric in display_order:
+            row = f"| **{metric}** |"
+            comb = hist_data[metric] + proj_annual_data[metric]
+            for idx, val in enumerate(comb):
+                val_str = f"${val:,.2f}" if metric == 'EPS' else f"{val:,.0f}"
+                if idx == 0: row += f" {val_str} |"
+                else:
+                    growth = (val - comb[idx-1]) / abs(comb[idx-1]) if comb[idx-1] else 0
+                    color = "#1d9e75" if (growth > 0 and metric in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) or (growth < 0 and metric not in ['Total Revenue', 'Gross Profit', 'Operating Income', 'Net Income', 'EPS']) else "#a32d2d"
+                    row += f" {val_str} <span style='color:{color}; font-weight:600; font-size:0.85em;'>({growth:+.1%})</span> |"
+            md += row + "\n"
+        st.markdown(md, unsafe_allow_html=True)
+
+        st.write("---")
+        st.subheader("Implied Stock Price")
+        col_val1, col_val2 = st.columns(2)
+        col_val1.write(f"**Current Market Price:** ${current_price:,.2f}")
+        col_val2.write(f"**Analyst Mean Target (1Y):** ${st.session_state.analyst_target_tab1:,.2f}" if isinstance(st.session_state.analyst_target_tab1, (int, float)) and pd.notna(st.session_state.analyst_target_tab1) else "**Analyst Mean Target (1Y):** N/A")
+            
+        t_pe = st.number_input("Target P/E Ratio:", value=25.0, step=1.0, key="pe_tab1")
+        t_prices = [proj_annual_data['EPS'][j] * t_pe for j in range(5)]
+        val_md = f"| Valuation | {' | '.join(proj_labels)} | 5-Yr CAGR |\n|---{'|---'*len(proj_labels)}|---|\n| **Target Price** |"
+        for tp in t_prices: val_md += f" **${tp:,.2f}** |"
+        cagr = (t_prices[-1] / current_price) ** (1/5) - 1 if current_price > 0 and t_prices[-1] > 0 else 0
+        val_md += f" <span style='color:{'#1d9e75' if cagr > 0 else '#a32d2d'}; font-weight:600;'>{cagr:+.1%}</span> |"
+        st.markdown(val_md, unsafe_allow_html=True)
+
+        st.subheader("Visual Forecasts")
+        combined_q_df = pd.concat([norm_df, pd.DataFrame(proj_quarterly_data, index=[norm_df.index[-1] + pd.DateOffset(months=3 * j) for j in range(1, 21)])])
+        ttm_eps = (combined_q_df['Net Income'].rolling(window=4, min_periods=1).sum() * (4 / combined_q_df['Net Income'].rolling(window=4, min_periods=1).count())) / combined_q_df['Shares Outstanding'].rolling(window=4, min_periods=1).mean()
+        
+        c_df = pd.DataFrame(index=combined_q_df.index)
+        c_df['Quarterly EPS'], c_df[f'Target Price (PE {t_pe:g})'] = combined_q_df['EPS'].round(2), (ttm_eps * t_pe).round(2)
+        c_df_reset = c_df.reset_index().rename(columns={'index': 'Date'})
+
+        base = alt.Chart(c_df_reset).encode(x=alt.X('Date:T', title=None, axis=alt.Axis(grid=True)))
+        l_eps = base.mark_line(color="#1d9e75", point=alt.OverlayMarkDef(color="#1d9e75", size=60)).encode(y=alt.Y('Quarterly EPS:Q', title='Quarterly EPS ($)', axis=alt.Axis(titleColor='#1d9e75', grid=True, minExtent=40)), tooltip=['Date:T', 'Quarterly EPS'])
+        l_prc = base.mark_line(color="#e8a329", point=alt.OverlayMarkDef(color="#e8a329", size=60)).encode(y=alt.Y(f'Target Price (PE {t_pe:g}):Q', title='Target Price ($)', axis=alt.Axis(titleColor='#e8a329', grid=False, minExtent=40)), tooltip=['Date:T', f'Target Price (PE {t_pe:g})'])
+        st.altair_chart(alt.layer(l_eps, l_prc).resolve_scale(y='independent').properties(height=350).interactive(), use_container_width=True)
+
+# ================= TAB 2: S&P 500 SCREENER =================
+with tab_screener:
+    st.subheader("S&P 500 Multi-Model Ranking Dashboard")
+    
+    if os.path.exists(CACHE_FILE) and 'raw_screener_df' not in st.session_state: st.session_state.raw_screener_df = pd.read_csv(CACHE_FILE)
+    st.markdown(f"**Data Last Loaded:** `{pd.to_datetime(os.path.getmtime(CACHE_FILE), unit='s').strftime('%B %d, %Y at %I:%M %p') if os.path.exists(CACHE_FILE) else 'Never'}`")
+    
+    st.write("### ⚡ Database & Watchlist Controls")
+    c1, c2, c3 = st.columns([1, 1, 1.5])
+
+    with c1:
+        st.write("**Bulk Refresh Matrix:**")
+        if st.button("🔄 Scan Entire S&P 500", use_container_width=True):
+            with st.spinner("Fetching S&P 500 Roster & Executing Fast Scan..."):
+                try: tickers = get_sp500_tickers()
+                except Exception as e: st.error(f"Failed to fetch stock index list: {e}"); st.stop()
+
+                progress_bar, status_text, screened_results, completed = st.progress(0), st.empty(), [], 0
+                with ThreadPoolExecutor(max_workers=10) as executor:
+                    for future in as_completed({executor.submit(process_single_screener_stock, t): t for t in tickers}):
+                        completed += 1
+                        if res := future.result(): screened_results.append(res)
+                        if completed % 15 == 0 or completed == len(tickers):
+                            progress_bar.progress(completed / len(tickers))
+                            status_text.write(f"Scanned {completed}/{len(tickers)}...")
+
+                status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
+                raw_df = pd.DataFrame(screened_results)
+                if 'Analyst Target' in raw_df.columns: raw_df = raw_df.drop(columns=['Analyst Target'])
+                raw_df.to_csv(CACHE_FILE, index=False)
+                st.session_state.raw_screener_df = raw_df
+                st.rerun()
+
+        if st.button("⭐ Refresh Watchlist Only", use_container_width=True):
+            if not st.session_state.watchlist: st.warning("Your Watchlist is empty.")
+            elif 'raw_screener_df' in st.session_state:
+                with st.spinner("Updating Watchlist Models..."):
+                    df_cache = st.session_state.raw_screener_df
+                    for tick in st.session_state.watchlist:
+                        if res := process_single_screener_stock(tick):
+                            if 'Analyst Target' in res: del res['Analyst Target']
+                            if tick in df_cache['Ticker'].values:
+                                for k, v in res.items(): df_cache.at[df_cache.index[df_cache['Ticker'] == tick][0], k] = v
+                            else: df_cache = pd.concat([df_cache, pd.DataFrame([res])], ignore_index=True)
+                    df_cache.to_csv(CACHE_FILE, index=False)
+                    st.session_state.raw_screener_df = df_cache
+                st.rerun()
+            else: st.error("Cache is empty. Run a full scan first to build the database.")
+
+    with c2:
+        st.write("**Targeted Action:**")
+        target_tick = st.text_input("Ticker", placeholder="e.g. NVDA", label_visibility="collapsed").upper().strip()
+        col_upd, col_wl = st.columns(2)
+        
+        if col_upd.button("Update Data", use_container_width=True) and target_tick:
+            if 'raw_screener_df' in st.session_state:
+                with st.spinner(f"Recalculating {target_tick}..."):
+                    if res := process_single_screener_stock(target_tick):
+                        df_cache = st.session_state.raw_screener_df
+                        if 'Analyst Target' in res: del res['Analyst Target']
+                        if target_tick in df_cache['Ticker'].values:
+                            for k, v in res.items(): df_cache.at[df_cache.index[df_cache['Ticker'] == target_tick][0], k] = v
+                        else: df_cache = pd.concat([df_cache, pd.DataFrame([res])], ignore_index=True)
+                        if 'Analyst Target' in df_cache.columns: df_cache = df_cache.drop(columns=['Analyst Target'])
+                        df_cache.to_csv(CACHE_FILE, index=False)
+                        st.session_state.raw_screener_df = df_cache
+                        st.rerun()
+                    else: st.error(f"Could not calculate projections for {target_tick}. Requires 3+ years of public data.")
+            else: st.error("Cache is empty. Run a full scan first to build the database.")
+            
+        if col_wl.button("⭐ Add/Drop", use_container_width=True) and target_tick:
+            if target_tick in st.session_state.watchlist: 
+                st.session_state.watchlist.remove(target_tick)
+                st.success(f"Removed {target_tick}")
+            else: 
+                st.session_state.watchlist.append(target_tick)
+                st.success(f"Added {target_tick}")
+            save_watchlist()
+            time.sleep(1)
+            st.rerun()
+
+    with c3:
+        st.write("**Current Watchlist:**")
+        st.caption(", ".join(st.session_state.watchlist) if st.session_state.watchlist else "Watchlist is empty. Add tickers via Targeted Action.")
+
+    if 'raw_screener_df' in st.session_state:
+        df_base = st.session_state.raw_screener_df.copy()
+        
+        expected_cols = [
+            "Company Name", "Industry", "Market Cap (B)", "Rev Growth (%)", "Current P/E", "Forward P/E", "5-Yr Avg P/E",
+            "PEG Ratio", "P/B Ratio", "P/S Ratio", "ROE (%)", "ROA (%)", "Debt/Equity", "Gross Margin (%)", "Profit Margin (%)", 
+            "Div Yield (%)", "Beta", "Short % Float", "Hist NI CAGR (%)"
+        ]
+        for col in expected_cols:
+            if col not in df_base.columns: 
+                df_base[col] = "N/A" if col in ["Company Name", "Industry"] else np.nan
+            
+        st.write("---")
+        
+        t_pe = t_fpe = t_avg_pe = t_peg = t_ps = t_pb = t_roe = t_pm = t_de = t_rg = t_dy = t_beta = t_mc = t_sh = t_rmse = t_cagr = t_wl_filter = False
+        range_pe = (0.0, 200.0); range_fpe = (0.0, 150.0); range_avg_pe = (0.0, 150.0); range_peg = (0.0, 10.0)
+        range_ps = (0.0, 50.0); range_pb = (0.0, 50.0); range_roe = (-100.0, 200.0); range_pm = (-100.0, 100.0)
+        range_de = (0.0, 500.0); range_rg = (-50.0, 200.0); range_dy = (0.0, 20.0); range_beta = (0.0, 5.0)
+        range_sh = (0.0, 50.0); range_mc = (0.0, 3000.0); range_cagr = (-50.0, 200.0); max_rmse = 1000000.0
+
+        with st.expander("🔬 Deep Toggle Filters", expanded=True):
+            col_search, col_pe, col_wl_tog = st.columns([1.5, 1.5, 1])
+            search_ticker = col_search.text_input("🔍 Search Ticker:", "").upper()
+            screener_pe = col_pe.number_input("Universal Target P/E Multiple for Model:", value=25.0, step=1.0, key="pe_screener")
+            t_wl_filter = col_wl_tog.toggle("⭐ Show Watchlist Only", value=False)
+            
+            st.write("##### Enable specific filters to constrain the matrix:")
+            f1, f2, f3, f4, f5 = st.columns(5)
+            with f1:
+                t_pe = st.toggle("Current P/E Range")
+                if t_pe: range_pe = st.slider("Current P/E", 0.0, 200.0, (10.0, 50.0), step=0.5, key="v_pe", label_visibility="collapsed")
+            with f2:
+                t_fpe = st.toggle("Forward P/E Range")
+                if t_fpe: range_fpe = st.slider("Forward P/E", 0.0, 150.0, (5.0, 35.0), step=0.5, key="v_fpe", label_visibility="collapsed")
+            with f3:
+                t_avg_pe = st.toggle("5-Yr Avg P/E Range")
+                if t_avg_pe: range_avg_pe = st.slider("5-Yr Avg P/E", 0.0, 150.0, (5.0, 35.0), step=0.5, key="v_avg_pe", label_visibility="collapsed")
+            with f4:
+                t_peg = st.toggle("PEG Ratio Range")
+                if t_peg: range_peg = st.slider("PEG Ratio", 0.0, 10.0, (0.0, 3.0), step=0.1, key="v_peg", label_visibility="collapsed")
+            with f5:
+                t_ps = st.toggle("P/S Ratio Range")
+                if t_ps: range_ps = st.slider("P/S Ratio", 0.0, 50.0, (0.0, 10.0), step=0.5, key="v_ps", label_visibility="collapsed")
+
+            f6, f7, f8, f9 = st.columns(4)
+            with f6:
+                t_pb = st.toggle("P/B Ratio Range")
+                if t_pb: range_pb = st.slider("P/B Ratio", 0.0, 50.0, (0.0, 15.0), step=0.5, key="v_pb", label_visibility="collapsed")
+            with f7:
+                t_roe = st.toggle("ROE (%) Range")
+                if t_roe: range_roe = st.slider("ROE (%)", -100.0, 200.0, (10.0, 200.0), step=1.0, key="v_roe", label_visibility="collapsed")
+            with f8:
+                t_pm = st.toggle("Profit Margin (%)")
+                if t_pm: range_pm = st.slider("Profit Margin (%)", -100.0, 100.0, (5.0, 100.0), step=1.0, key="v_pm", label_visibility="collapsed")
+            with f9:
+                t_de = st.toggle("Debt/Equity Range")
+                if t_de: range_de = st.slider("Debt/Equity", 0.0, 500.0, (0.0, 200.0), step=5.0, key="v_de", label_visibility="collapsed")
+
+            f10, f11, f12, f13, f14 = st.columns(5)
+            with f10:
+                t_rg = st.toggle("Rev Growth (%)")
+                if t_rg: range_rg = st.slider("Rev Growth (%)", -50.0, 200.0, (5.0, 200.0), step=1.0, key="v_rg", label_visibility="collapsed")
+            with f11:
+                t_dy = st.toggle("Div Yield (%)")
+                if t_dy: range_dy = st.slider("Div Yield (%)", 0.0, 20.0, (1.0, 20.0), step=0.5, key="v_dy", label_visibility="collapsed")
+            with f12:
+                t_beta = st.toggle("Beta Range")
+                if t_beta: range_beta = st.slider("Beta", 0.0, 5.0, (0.0, 1.5), step=0.1, key="v_beta", label_visibility="collapsed")
+            with f13:
+                t_sh = st.toggle("Short % Float")
+                if t_sh: range_sh = st.slider("Short % Float", 0.0, 50.0, (0.0, 10.0), step=0.5, key="v_sh", label_visibility="collapsed")
+            with f14:
+                t_mc = st.toggle("Market Cap (B)")
+                if t_mc: range_mc = st.slider("Market Cap (B)", 0.0, 3000.0, (10.0, 3000.0), step=5.0, key="v_mc", label_visibility="collapsed")
+
+            st.write("##### Engine Confidence Limits")
+            e1, e2 = st.columns(2)
+            with e1:
+                t_rmse = st.toggle("Max Tracking Error (RMSE)", value=True)
+                if t_rmse: max_rmse = st.slider("Max Tracking Error (RMSE):", float(df_base['Avg Tracking Error (RMSE)'].min()), float(df_base['Avg Tracking Error (RMSE)'].max()), float(df_base['Avg Tracking Error (RMSE)'].max() * 0.4), label_visibility="collapsed")
+            with e2:
+                t_cagr = st.toggle("5-Yr CAGR (%) Range", value=True)
+                if t_cagr: range_cagr = st.slider("5-Yr CAGR (%)", float(df_base['5-Yr CAGR'].min()) if '5-Yr CAGR' in df_base.columns else -50.0, 200.0, (12.0, 200.0), step=1.0, label_visibility="collapsed")
+
+        if search_ticker: df_base = df_base[df_base['Ticker'].str.contains(search_ticker, case=False, na=False)]
+        
+        df_base['Year 5 Target'] = df_base['Year 5 EPS'] * screener_pe
+        df_base['5-Yr CAGR'] = np.where(df_base['Year 5 Target'] > 0, ((df_base['Year 5 Target'] / df_base['Current Price']) ** (1/5) - 1) * 100, -100.0)
+        
+        filtered_df = df_base.copy()
+        if t_wl_filter: filtered_df = filtered_df[filtered_df['Ticker'].isin(st.session_state.watchlist)]
+        
+        if t_pe: filtered_df = filtered_df[filtered_df['Current P/E'].between(range_pe[0], range_pe[1]) | filtered_df['Current P/E'].isna()]
+        if t_fpe: filtered_df = filtered_df[filtered_df['Forward P/E'].between(range_fpe[0], range_fpe[1]) | filtered_df['Forward P/E'].isna()]
+        if t_avg_pe: filtered_df = filtered_df[filtered_df['5-Yr Avg P/E'].between(range_avg_pe[0], range_avg_pe[1]) | filtered_df['5-Yr Avg P/E'].isna()]
+        if t_peg: filtered_df = filtered_df[filtered_df['PEG Ratio'].between(range_peg[0], range_peg[1]) | filtered_df['PEG Ratio'].isna()]
+        if t_ps: filtered_df = filtered_df[filtered_df['P/S Ratio'].between(range_ps[0], range_ps[1]) | filtered_df['P/S Ratio'].isna()]
+        if t_pb: filtered_df = filtered_df[filtered_df['P/B Ratio'].between(range_pb[0], range_pb[1]) | filtered_df['P/B Ratio'].isna()]
+        if t_roe: filtered_df = filtered_df[filtered_df['ROE (%)'].between(range_roe[0], range_roe[1]) | filtered_df['ROE (%)'].isna()]
+        if t_pm: filtered_df = filtered_df[filtered_df['Profit Margin (%)'].between(range_pm[0], range_pm[1]) | filtered_df['Profit Margin (%)'].isna()]
+        if t_de: filtered_df = filtered_df[filtered_df['Debt/Equity'].between(range_de[0], range_de[1]) | filtered_df['Debt/Equity'].isna()]
+        if t_rg: filtered_df = filtered_df[filtered_df['Rev Growth (%)'].between(range_rg[0], range_rg[1]) | filtered_df['Rev Growth (%)'].isna()]
+        if t_dy: filtered_df = filtered_df[filtered_df['Div Yield (%)'].between(range_dy[0], range_dy[1]) | filtered_df['Div Yield (%)'].isna()]
+        if t_beta: filtered_df = filtered_df[filtered_df['Beta'].between(range_beta[0], range_beta[1]) | filtered_df['Beta'].isna()]
+        if t_sh: filtered_df = filtered_df[filtered_df['Short % Float'].between(range_sh[0], range_sh[1]) | filtered_df['Short % Float'].isna()]
+        if t_mc: filtered_df = filtered_df[filtered_df['Market Cap (B)'].between(range_mc[0], range_mc[1]) | filtered_df['Market Cap (B)'].isna()]
+        if t_rmse: filtered_df = filtered_df[filtered_df['Avg Tracking Error (RMSE)'] <= max_rmse]
+        if t_cagr: filtered_df = filtered_df[filtered_df['5-Yr CAGR'].between(range_cagr[0], range_cagr[1])]
+
+        filtered_df = filtered_df.sort_values(by="5-Yr CAGR", ascending=False).reset_index(drop=True)
+        
+        display_cols = [
+            "Ticker", "Company Name", "Industry", "Current Price", "Year 5 Target", "5-Yr CAGR", 
+            "Market Cap (B)", "Current P/E", "Forward P/E", "5-Yr Avg P/E", "PEG Ratio", "P/S Ratio", "P/B Ratio",
+            "ROE (%)", "Debt/Equity", "Profit Margin (%)", "Rev Growth (%)", 
+            "Div Yield (%)", "Avg Tracking Error (RMSE)"
+        ]
+        
+        st.write(f"Showing **{len(filtered_df)}** matching profiles.")
+        st.dataframe(filtered_df[display_cols].style.format({
+            "Current Price": "${:,.2f}", "Year 5 Target": "${:,.2f}", "5-Yr CAGR": "{:+.1f}%", 
+            "Market Cap (B)": "${:.2f}B", "Current P/E": "{:.2f}", "Forward P/E": "{:.2f}", "5-Yr Avg P/E": "{:.2f}", "PEG Ratio": "{:.2f}", 
+            "P/S Ratio": "{:.2f}", "P/B Ratio": "{:.2f}", "ROE (%)": "{:.1f}%", 
+            "Debt/Equity": "{:.2f}", "Profit Margin (%)": "{:.1f}%", "Rev Growth (%)": "{:.1f}%", 
+            "Div Yield (%)": "{:.2f}%", "Avg Tracking Error (RMSE)": "±${:,.0f}"
+        }, na_rep="N/A"), use_container_width=True)
+
+# ================= TAB 3: STRATEGY BACKTESTER =================
+with tab_backtest:
+    st.subheader("📊 Pure Point-In-Time S&P 500 Backtester")
+    st.markdown("Isolates companies outpacing inflation and weights them based on their **true historical market cap** on day one of the horizon to eliminate look-ahead bias.")
+    
+    if 'raw_screener_df' not in st.session_state or st.session_state.raw_screener_df.empty:
+        st.warning("⚠️ **Engine Uninitialized:** Please go to the **S&P 500 Screening Dashboard** tab and run the **Bulk Refresh Matrix** to build the fundamental database first.")
+    else:
+        st.write("##### ⚙️ Strategy Parameters")
+        c1, c2, c3 = st.columns(3)
+        inf_rate = c1.slider("Inflation Rate (%)", min_value=0.0, max_value=15.0, value=4.2, step=0.1) / 100
+        hurdle_rate = c2.slider("Real Growth Hurdle (%)", min_value=0.0, max_value=25.0, value=5.0, step=0.5) / 100
+        backtest_period = c3.selectbox("Backtest Horizon", options=["1y", "3y", "5y"], index=2)
+        
+        df = st.session_state.raw_screener_df.copy()
+        
+        if 'Hist NI CAGR (%)' not in df.columns or df['Hist NI CAGR (%)'].isna().all():
+            st.error("Your cache is missing the Historical Net Income data. Please go to the Screener tab and click **🔄 Scan Entire S&P 500** to update your database.")
+        else:
+            # Fisher Equation
+            df['Nominal CAGR'] = df['Hist NI CAGR (%)'] / 100
+            df['Real Growth'] = ((1 + df['Nominal CAGR']) / (1 + inf_rate)) - 1
+            
+            survivors = df[df['Real Growth'] >= hurdle_rate].copy()
+            
+            if survivors.empty:
+                st.error("No companies met the Real Growth hurdle rate. Lower your parameters.")
+            else:
+                surviving_tickers = survivors['Ticker'].tolist()
+                
+                with st.spinner(f"Downloading {backtest_period} historical pricing & parsing point-in-time assets..."):
+                    prices = get_historical_prices(surviving_tickers, backtest_period)
+                    if not prices.empty:
+                        prices = prices.dropna(axis=1, how='all')
+                    valid_tickers = [t for t in surviving_tickers if t in prices.columns]
+                    
+                if not valid_tickers:
+                    st.error("Insufficient historical price data for the surviving basket.")
+                else:
+                    # Pinpoint the day-one date of the historical backtest window
+                    start_date = prices.index[0]
+                    st.caption(f"Portfolio locked and initialized on True Point-in-Time Matrix: **{start_date.strftime('%B %d, %Y')}**")
+                    
+                    pit_mcap_list = []
+                    for t in valid_tickers:
+                        hist_price = prices[t].iloc[0]
+                        shares_found = None
+                        
+                        # Check local deep vault file first for true historical shares
+                        cache_path = os.path.join(TICKER_CACHE_DIR, f"{t}_deep.csv")
+                        if os.path.exists(cache_path):
+                            try:
+                                v_df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+                                close_idx = v_df.index.get_indexer([start_date], method='nearest')[0]
+                                if close_idx != -1:
+                                    # Convert back out of thousands unit if deep cache used it
+                                    shares_found = v_df['Shares Outstanding'].iloc[close_idx] * 1000
+                            except: pass
+                            
+                        # Intelligent Fallback if no vault file exists or lookup fails
+                        if shares_found is None or pd.isna(shares_found):
+                            current_mcap = survivors.loc[survivors['Ticker'] == t, 'Market Cap (B)'].values[0] * 1e9
+                            current_price = survivors.loc[survivors['Ticker'] == t, 'Current Price'].values[0]
+                            if current_price > 0:
+                                approx_shares = current_mcap / current_price
+                                shares_found = approx_shares
+                                
+                        pit_mcap = (hist_price * shares_found) / 1e9 if shares_found else 0.0
+                        pit_mcap_list.append(pit_mcap)
+                        
+                    # Re-align weights dynamically using the exact point-in-time calculation
+                    survivors_pit = survivors[survivors['Ticker'].isin(valid_tickers)].copy()
+                    survivors_pit['PIT Market Cap (B)'] = pit_mcap_list
+                    total_pit_mcap = survivors_pit['PIT Market Cap (B)'].sum()
+                    
+                    if total_pit_mcap <= 0:
+                        survivors_pit['Weight'] = 1.0 / len(survivors_pit)
+                    else:
+                        survivors_pit['Weight'] = survivors_pit['PIT Market Cap (B)'] / total_pit_mcap
+                        
+                    survivors_pit = survivors_pit.sort_values(by='Weight', ascending=False)
+                    
+                    st.subheader("Day-One Portfolio Weights (No Look-Ahead Bias)")
+                    survivors_pit['Real Growth (%)'] = (survivors_pit['Real Growth'] * 100).round(2)
+                    
+                    fig_tree = px.treemap(
+                        survivors_pit, path=[px.Constant("True PIT Index"), 'Ticker'], values='Weight',
+                        color='Real Growth (%)', color_continuous_scale='Greens', hover_data=['PIT Market Cap (B)']
+                    )
+                    fig_tree.update_layout(margin=dict(t=20, l=10, r=10, b=10), height=400)
+                    st.plotly_chart(fig_tree, use_container_width=True)
+
+                    backtest_weights = survivors_pit.set_index('Ticker').loc[valid_tickers, 'Weight']
+                    daily_returns = prices.pct_change().dropna()
+                    
+                    strat_returns = (daily_returns[valid_tickers] * backtest_weights.values).sum(axis=1)
+                    
+                    if 'SPY' in daily_returns.columns:
+                        spy_returns = daily_returns['SPY']
+                        plot_df = pd.DataFrame({
+                            "Custom PIT Strategy": (1 + strat_returns).cumprod() * 100,
+                            "SPY Benchmark": (1 + spy_returns).cumprod() * 100
+                        })
+
+                        st.subheader(f"Historical Performance ({backtest_period})")
+                        fig_line = px.line(plot_df, labels={'value': 'Cumulative Return ($100 Base)', 'Date': 'Date'}, color_discrete_map={"Custom PIT Strategy": "#00FF00", "SPY Benchmark": "#808080"})
+                        fig_line.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), margin=dict(t=20, l=10, r=10, b=10), xaxis_title="", yaxis_title="Portfolio Value ($)", height=350)
+                        st.plotly_chart(fig_line, use_container_width=True)
+                    else:
+                        st.error("Failed to load SPY benchmark data.")
+
+                with st.expander("View Surviving Constituents & PIT Weights"):
+                    st.dataframe(
+                        survivors_pit[['Ticker', 'Company Name', 'PIT Market Cap (B)', 'Hist NI CAGR (%)', 'Real Growth (%)', 'Weight']].style.format({
+                            'Hist NI CAGR (%)': '{:.2f}%', 'Real Growth (%)': '{:.2f}%', 'Weight': '{:.2%}', 'PIT Market Cap (B)': '${:.2f}B'
+                        }), use_container_width=True
+                    )
