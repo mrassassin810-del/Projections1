@@ -115,6 +115,7 @@ def build_market_matrix(tickers):
             if pd.notna(cagr) and pd.notna(mcap): results.append({"Ticker": t, "Nominal CAGR": cagr, "Market Cap": mcap})
     return pd.DataFrame(results)
 
+@st.cache_data(ttl=86400)
 def get_historical_prices(tickers, period):
     data = yf.download(tickers + ['SPY'], period=period, interval="1d", auto_adjust=True, progress=False)
     return data['Close']
@@ -523,7 +524,13 @@ with tab_screener:
             if col not in df_base.columns: df_base[col] = "N/A" if col in ["Company Name", "Industry"] else np.nan
             
         st.write("---")
+        
+        # PRE-INITIALIZE ALL VARIABLES
         t_pe = t_fpe = t_avg_pe = t_peg = t_ps = t_pb = t_roe = t_pm = t_de = t_rg = t_dy = t_beta = t_mc = t_sh = t_rmse = t_cagr = t_wl_filter = False
+        range_pe = (0.0, 200.0); range_fpe = (0.0, 150.0); range_avg_pe = (0.0, 150.0); range_peg = (0.0, 10.0)
+        range_ps = (0.0, 50.0); range_pb = (0.0, 50.0); range_roe = (-100.0, 200.0); range_pm = (-100.0, 100.0)
+        range_de = (0.0, 500.0); range_rg = (-50.0, 200.0); range_dy = (0.0, 20.0); range_beta = (0.0, 5.0)
+        range_sh = (0.0, 50.0); range_mc = (0.0, 3000.0); range_cagr = (-50.0, 200.0); max_rmse = 1000000.0
 
         with st.expander("🔬 Deep Toggle Filters", expanded=True):
             col_search, col_pe, col_wl_tog = st.columns([1.5, 1.5, 1])
@@ -563,7 +570,7 @@ with tab_screener:
                 t_de = st.toggle("Debt/Equity Range")
                 if t_de: range_de = st.slider("Debt/Equity", 0.0, 500.0, (0.0, 200.0), step=5.0, key="v_de", label_visibility="collapsed")
 
-            f10, f11, f12, f13 = st.columns(4)
+            f10, f11, f12, f13, f14 = st.columns(5)
             with f10:
                 t_rg = st.toggle("Rev Growth (%)")
                 if t_rg: range_rg = st.slider("Rev Growth (%)", -50.0, 200.0, (5.0, 200.0), step=1.0, key="v_rg", label_visibility="collapsed")
@@ -576,6 +583,9 @@ with tab_screener:
             with f13:
                 t_sh = st.toggle("Short % Float")
                 if t_sh: range_sh = st.slider("Short % Float", 0.0, 50.0, (0.0, 10.0), step=0.5, key="v_sh", label_visibility="collapsed")
+            with f14:
+                t_mc = st.toggle("Market Cap (B)")
+                if t_mc: range_mc = st.slider("Market Cap (B)", 0.0, 3000.0, (10.0, 3000.0), step=5.0, key="v_mc", label_visibility="collapsed")
 
             st.write("##### Engine Confidence Limits")
             e1, e2 = st.columns(2)
@@ -607,6 +617,7 @@ with tab_screener:
         if t_dy: filtered_df = filtered_df[filtered_df['Div Yield (%)'].between(range_dy[0], range_dy[1]) | filtered_df['Div Yield (%)'].isna()]
         if t_beta: filtered_df = filtered_df[filtered_df['Beta'].between(range_beta[0], range_beta[1]) | filtered_df['Beta'].isna()]
         if t_sh: filtered_df = filtered_df[filtered_df['Short % Float'].between(range_sh[0], range_sh[1]) | filtered_df['Short % Float'].isna()]
+        if t_mc: filtered_df = filtered_df[filtered_df['Market Cap (B)'].between(range_mc[0], range_mc[1]) | filtered_df['Market Cap (B)'].isna()]
         if t_rmse: filtered_df = filtered_df[filtered_df['Avg Tracking Error (RMSE)'] <= max_rmse]
         if t_cagr: filtered_df = filtered_df[filtered_df['5-Yr CAGR'].between(range_cagr[0], range_cagr[1])]
 
@@ -614,7 +625,7 @@ with tab_screener:
         
         display_cols = [
             "Ticker", "Company Name", "Industry", "Current Price", "Year 5 Target", "5-Yr CAGR", 
-            "Current P/E", "Forward P/E", "5-Yr Avg P/E", "PEG Ratio", "P/S Ratio", "P/B Ratio",
+            "Market Cap (B)", "Current P/E", "Forward P/E", "5-Yr Avg P/E", "PEG Ratio", "P/S Ratio", "P/B Ratio",
             "ROE (%)", "Debt/Equity", "Profit Margin (%)", "Rev Growth (%)", 
             "Div Yield (%)", "Avg Tracking Error (RMSE)"
         ]
@@ -622,7 +633,7 @@ with tab_screener:
         st.write(f"Showing **{len(filtered_df)}** matching profiles.")
         st.dataframe(filtered_df[display_cols].style.format({
             "Current Price": "${:,.2f}", "Year 5 Target": "${:,.2f}", "5-Yr CAGR": "{:+.1f}%", 
-            "Current P/E": "{:.2f}", "Forward P/E": "{:.2f}", "5-Yr Avg P/E": "{:.2f}", "PEG Ratio": "{:.2f}", 
+            "Market Cap (B)": "${:.2f}B", "Current P/E": "{:.2f}", "Forward P/E": "{:.2f}", "5-Yr Avg P/E": "{:.2f}", "PEG Ratio": "{:.2f}", 
             "P/S Ratio": "{:.2f}", "P/B Ratio": "{:.2f}", "ROE (%)": "{:.1f}%", 
             "Debt/Equity": "{:.2f}", "Profit Margin (%)": "{:.1f}%", "Rev Growth (%)": "{:.1f}%", 
             "Div Yield (%)": "{:.2f}%", "Avg Tracking Error (RMSE)": "±${:,.0f}"
@@ -633,74 +644,82 @@ with tab_backtest:
     st.subheader("📊 Macro-Adjusted S&P 500 Backtester")
     st.markdown("Isolates companies outpacing inflation and backtests their historical market-cap weighted performance against the broader index.")
     
-    st.write("##### ⚙️ Strategy Parameters")
-    c1, c2, c3 = st.columns(3)
-    inf_rate = c1.slider("Inflation Rate (%)", min_value=0.0, max_value=15.0, value=4.2, step=0.1) / 100
-    hurdle_rate = c2.slider("Real Growth Hurdle (%)", min_value=0.0, max_value=25.0, value=5.0, step=0.5) / 100
-    backtest_period = c3.selectbox("Backtest Horizon", options=["1y", "3y", "5y"], index=2)
-    
-    st.write("")
-    run_engine = st.button("🚀 Run Backtest", use_container_width=True)
-
-    if run_engine:
-        with st.spinner("Compiling fundamental matrix... (This takes ~30 seconds)"):
+    if "bt_matrix" not in st.session_state: st.session_state.bt_matrix = pd.DataFrame()
+        
+    st.write("##### ⚡ Engine Initialization")
+    if st.button("Download S&P 500 Baseline Data", use_container_width=True):
+        with st.spinner("Downloading 5-year financials for 500 companies..."):
             tickers = get_sp500_tickers()
-            df = build_market_matrix(tickers)
-            
-            # The Fisher Equation: ((1 + Nominal) / (1 + Inflation)) - 1
-            df['Real Growth'] = ((1 + df['Nominal CAGR']) / (1 + inf_rate)) - 1
-            survivors = df[df['Real Growth'] >= hurdle_rate].copy()
-            
-            if survivors.empty:
-                st.error("No companies met the Real Growth hurdle rate. Lower your parameters.")
-                st.stop()
-                
+            matrix = build_market_matrix(tickers)
+            if matrix.empty:
+                st.error("Failed to fetch market data from Yahoo Finance. Please try again.")
+            else:
+                st.session_state.bt_matrix = matrix
+                st.success("Data loaded! Adjust parameters below to backtest.")
+
+    if not st.session_state.bt_matrix.empty:
+        st.write("##### ⚙️ Strategy Parameters")
+        c1, c2, c3 = st.columns(3)
+        inf_rate = c1.slider("Inflation Rate (%)", min_value=0.0, max_value=15.0, value=4.2, step=0.1) / 100
+        hurdle_rate = c2.slider("Real Growth Hurdle (%)", min_value=0.0, max_value=25.0, value=5.0, step=0.5) / 100
+        backtest_period = c3.selectbox("Backtest Horizon", options=["1y", "3y", "5y"], index=2)
+        
+        df = st.session_state.bt_matrix.copy()
+        
+        # The Fisher Equation: ((1 + Nominal) / (1 + Inflation)) - 1
+        df['Real Growth'] = ((1 + df['Nominal CAGR']) / (1 + inf_rate)) - 1
+        survivors = df[df['Real Growth'] >= hurdle_rate].copy()
+        
+        if survivors.empty:
+            st.error("No companies met the Real Growth hurdle rate. Lower your parameters.")
+        else:
             total_mcap = survivors['Market Cap'].sum()
             survivors['Weight'] = survivors['Market Cap'] / total_mcap
             survivors = survivors.sort_values(by='Weight', ascending=False)
-            st.success(f"Screening complete. **{len(survivors)} / {len(tickers)}** companies survived the hurdle.")
 
-        st.subheader("Current Portfolio Weights")
-        survivors['Market Cap (B)'] = (survivors['Market Cap'] / 1e9).round(2)
-        survivors['Real Growth (%)'] = (survivors['Real Growth'] * 100).round(2)
-        
-        fig_tree = px.treemap(
-            survivors, path=[px.Constant("Surviving Index"), 'Ticker'], values='Weight',
-            color='Real Growth (%)', color_continuous_scale='Greens', hover_data=['Market Cap (B)']
-        )
-        fig_tree.update_layout(margin=dict(t=20, l=10, r=10, b=10), height=400)
-        st.plotly_chart(fig_tree, use_container_width=True)
-
-        with st.spinner(f"Downloading {backtest_period} historical price data..."):
-            surviving_tickers = survivors['Ticker'].tolist()
-            prices = get_historical_prices(surviving_tickers, backtest_period)
-            prices = prices.dropna(axis=1, how='all')
-            valid_tickers = [t for t in surviving_tickers if t in prices.columns]
+            st.subheader("Current Portfolio Weights")
+            survivors['Market Cap (B)'] = (survivors['Market Cap'] / 1e9).round(2)
+            survivors['Real Growth (%)'] = (survivors['Real Growth'] * 100).round(2)
             
-            if not valid_tickers:
-                st.error("Insufficient historical price data for the surviving basket.")
-                st.stop()
-                
-            backtest_weights = survivors.set_index('Ticker').loc[valid_tickers, 'Weight']
-            backtest_weights = backtest_weights / backtest_weights.sum()
-
-            daily_returns = prices.pct_change().dropna()
-            strat_returns = (daily_returns[valid_tickers] * backtest_weights.values).sum(axis=1)
-            spy_returns = daily_returns['SPY']
-            
-            plot_df = pd.DataFrame({
-                "Custom Strategy": (1 + strat_returns).cumprod() * 100,
-                "SPY Benchmark": (1 + spy_returns).cumprod() * 100
-            })
-
-        st.subheader(f"Historical Performance ({backtest_period})")
-        fig_line = px.line(plot_df, labels={'value': 'Cumulative Return ($100 Base)', 'Date': 'Date'}, color_discrete_map={"Custom Strategy": "#00FF00", "SPY Benchmark": "#808080"})
-        fig_line.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), margin=dict(t=20, l=10, r=10, b=10), xaxis_title="", yaxis_title="Portfolio Value ($)", height=350)
-        st.plotly_chart(fig_line, use_container_width=True)
-
-        with st.expander("View Surviving Constituents"):
-            st.dataframe(
-                survivors[['Ticker', 'Market Cap (B)', 'Nominal CAGR', 'Real Growth (%)', 'Weight']].style.format({
-                    'Nominal CAGR': '{:.2%}', 'Weight': '{:.2%}'
-                }), use_container_width=True
+            fig_tree = px.treemap(
+                survivors, path=[px.Constant("Surviving Index"), 'Ticker'], values='Weight',
+                color='Real Growth (%)', color_continuous_scale='Greens', hover_data=['Market Cap (B)']
             )
+            fig_tree.update_layout(margin=dict(t=20, l=10, r=10, b=10), height=400)
+            st.plotly_chart(fig_tree, use_container_width=True)
+
+            with st.spinner(f"Downloading {backtest_period} historical price data..."):
+                surviving_tickers = survivors['Ticker'].tolist()
+                prices = get_historical_prices(surviving_tickers, backtest_period)
+                prices = prices.dropna(axis=1, how='all')
+                valid_tickers = [t for t in surviving_tickers if t in prices.columns]
+                
+                if not valid_tickers:
+                    st.error("Insufficient historical price data for the surviving basket.")
+                else:
+                    backtest_weights = survivors.set_index('Ticker').loc[valid_tickers, 'Weight']
+                    backtest_weights = backtest_weights / backtest_weights.sum()
+
+                    daily_returns = prices.pct_change().dropna()
+                    strat_returns = (daily_returns[valid_tickers] * backtest_weights.values).sum(axis=1)
+                    if 'SPY' in daily_returns.columns:
+                        spy_returns = daily_returns['SPY']
+                        
+                        plot_df = pd.DataFrame({
+                            "Custom Strategy": (1 + strat_returns).cumprod() * 100,
+                            "SPY Benchmark": (1 + spy_returns).cumprod() * 100
+                        })
+
+                        st.subheader(f"Historical Performance ({backtest_period})")
+                        fig_line = px.line(plot_df, labels={'value': 'Cumulative Return ($100 Base)', 'Date': 'Date'}, color_discrete_map={"Custom Strategy": "#00FF00", "SPY Benchmark": "#808080"})
+                        fig_line.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1), margin=dict(t=20, l=10, r=10, b=10), xaxis_title="", yaxis_title="Portfolio Value ($)", height=350)
+                        st.plotly_chart(fig_line, use_container_width=True)
+                    else:
+                        st.error("Failed to load SPY benchmark data.")
+
+            with st.expander("View Surviving Constituents"):
+                st.dataframe(
+                    survivors[['Ticker', 'Market Cap (B)', 'Nominal CAGR', 'Real Growth (%)', 'Weight']].style.format({
+                        'Nominal CAGR': '{:.2%}', 'Weight': '{:.2%}'
+                    }), use_container_width=True
+                )
