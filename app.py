@@ -252,7 +252,7 @@ def run_projections(norm_df, x_hist, x_fut, overrides=None, force_conservative=F
 def process_single_screener_stock(ticker):
     try:
         norm_df, current_p, _, _, _ = fetch_financial_data(ticker, force_deep_dive=False)
-        if norm_df.empty or len(norm_df) < 2: return None
+        if norm_df is None or norm_df.empty or len(norm_df) < 2: return None
         
         stock = yf.Ticker(ticker)
         hist_5y = stock.history(period="5y")
@@ -434,18 +434,27 @@ with tab_screener:
     with c1:
         st.write("**Bulk Refresh Matrix:**")
         if st.button("🔄 Scan Entire S&P 500", use_container_width=True):
-            with st.spinner("Fetching S&P 500 Roster & Executing Fast Scan..."):
+            with st.spinner("Fetching S&P 500 Roster & Executing Institutional Batched Scan..."):
                 try: tickers = get_sp500_tickers()
                 except Exception as e: st.error(f"Failed to fetch stock index list: {e}"); st.stop()
 
-                progress_bar, status_text, screened_results, completed = st.progress(0), st.empty(), [], 0
-                with ThreadPoolExecutor(max_workers=10) as executor:
-                    for future in as_completed({executor.submit(process_single_screener_stock, t): t for t in tickers}):
-                        completed += 1
-                        if res := future.result(): screened_results.append(res)
-                        if completed % 15 == 0 or completed == len(tickers):
-                            progress_bar.progress(completed / len(tickers))
-                            status_text.write(f"Scanned {completed}/{len(tickers)}...")
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                screened_results = []
+                
+                # BATCH PIPELINE: Prevents Yahoo Finance from blocking your IP and returning only 4 stocks.
+                BATCH_SIZE = 25
+                for i in range(0, len(tickers), BATCH_SIZE):
+                    batch = tickers[i:i+BATCH_SIZE]
+                    with ThreadPoolExecutor(max_workers=5) as executor:
+                        futures = [executor.submit(process_single_screener_stock, t) for t in batch]
+                        for future in as_completed(futures):
+                            res = future.result()
+                            if res: screened_results.append(res)
+                    
+                    progress_bar.progress(min((i + BATCH_SIZE) / len(tickers), 1.0))
+                    status_text.write(f"Scanned {len(screened_results)} / {len(tickers)} companies...")
+                    time.sleep(1) # Institutional throttling to respect API limits
 
                 status_text.success(f"Matrix complete! Modeled {len(screened_results)} companies.")
                 raw_df = pd.DataFrame(screened_results)
@@ -507,19 +516,16 @@ with tab_screener:
 
     st.write("---")
 
-    # DEFENSIVE DATA CHECK TO AVOID BLANK SCREENS
     if 'raw_screener_df' not in st.session_state or st.session_state.raw_screener_df.empty:
         st.info("💡 **Database Status:** No structural metrics inside memory. Please click **🔄 Scan Entire S&P 500** to pull data and populate the dashboard.")
     else:
         df_base = st.session_state.raw_screener_df.copy()
         screener_pe = st.number_input("Universal Target P/E Multiple for Model:", value=25.0, step=1.0, key="pe_screener")
 
-        # Force key math metrics up front to avoid column mismatches
         df_base['Year 5 Target'] = df_base['Year 5 EPS'].fillna(0) * screener_pe
         df_base['5-Yr CAGR'] = np.where(df_base['Year 5 Target'] > 0, ((df_base['Year 5 Target'] / df_base['Current Price'].replace(0, np.nan)) ** (1/5) - 1) * 100, -100.0)
         df_base['5-Yr CAGR'] = df_base['5-Yr CAGR'].fillna(-100.0)
 
-        # Secure default value limits for sliders (No NaNs or empty array min/max errors)
         def get_safe_bounds(series, d_min, d_max):
             cleaned = series.dropna()
             if cleaned.empty: return float(d_min), float(d_max)
@@ -652,7 +658,6 @@ with tab_backtest:
     else:
         df = pd.read_csv(CACHE_FILE)
         
-        # Ensure columns exist before filtering to stop blank screen errors
         required_cols = ['Ticker', 'Hist NI CAGR (%)', 'Market Cap (B)', 'Current Price', 'Company Name', 'Industry']
         if not all(col in df.columns for col in required_cols):
             st.error(f"Your cache file is missing required columns. Please rerun the full scan in the Screener tab.")
@@ -667,7 +672,7 @@ with tab_backtest:
             inf_rate = c2.slider("Auto-Tracked Inflation Rate (%)", min_value=0.0, max_value=15.0, value=default_inf, step=0.1, key="bt_inf_slider") / 100
             hurdle_rate = c3.slider("Real Growth Hurdle (%)", min_value=0.0, max_value=25.0, value=5.0, step=0.5, key="bt_hurdle_slider") / 100
             
-            # Formulate Real Growth metrics up front
+            # Fisher Equation with 0 fill to gracefully handle absent metrics
             df['Nominal CAGR'] = df['Hist NI CAGR (%)'].fillna(0) / 100
             df['Real Growth'] = ((1 + df['Nominal CAGR']) / (1 + inf_rate)) - 1
             survivors = df[df['Real Growth'] >= hurdle_rate].copy()
@@ -681,9 +686,9 @@ with tab_backtest:
                     surviving_tickers = survivors['Ticker'].tolist()
                     
                     with st.spinner(f"Downloading historical pricing and calculating risk metrics for {len(survivors)} tickers..."):
+                        # 'auto_adjust=True' accurately models total return (dividends/splits) vs. basic price return
                         prices = yf.download(surviving_tickers + ['SPY'], period=backtest_period, interval="1d", auto_adjust=True, progress=False)['Close']
                         
-                        # Forward fill and backward fill cleanly to secure calculations
                         prices = prices.ffill().bfill()
                         valid_tickers = [t for t in surviving_tickers if t in prices.columns]
                         
